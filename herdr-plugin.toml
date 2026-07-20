@@ -1,0 +1,34 @@
+id = "rcosteira.readpending"
+name = "Read Pending"
+version = "0.1.0"
+min_herdr_version = "0.7.4"
+description = "Mark agents you haven't finished reading. Numbered badge ($read) + a reorderable list pane. Auto-clears when you focus the agent."
+platforms = ["macos", "linux"]
+
+# Toggle read-pending on the focused agent. `pane` context so it is eligible
+# for the right-click pane menu; also bind a key (see README) as the sure path.
+[[actions]]
+id = "toggle"
+title = "Read pending: toggle on focused agent"
+command = ["python3", "readpending.py", "toggle"]
+contexts = ["pane"]
+
+# Open the reorderable list of pending agents.
+[[actions]]
+id = "open-list"
+title = "Read pending: open list"
+command = ["python3", "readpending.py", "open-list"]
+contexts = ["global"]
+
+# The list pane itself (opened by the action above or `herdr plugin pane open`).
+[[panes]]
+id = "list"
+title = "Read Pending"
+command = ["python3", "readpending.py", "ui"]
+placement = "overlay"
+
+# NO auto-clear-on-focus hook: herdr 0.7.4 parses [[events]] but its plugin-hook
+# allowlist accepts none of the pane/agent event names (pane_focused,
+# pane_agent_status_changed, ... all warn "unknown event"). Reactive behaviour
+# must be a companion process (poll loop or socket events.subscribe), not a
+# manifest hook. Auto-clear is handled by the list pane while it is open.
