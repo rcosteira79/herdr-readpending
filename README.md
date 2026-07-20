@@ -4,6 +4,8 @@ Mark [herdr](https://herdr.dev) agents you started reading but haven't finished.
 For the case: an agent finishes, you jump to it, skim, get pulled away before
 reading it all — flag it as **read pending** so you come back.
 
+![Sidebar agents carrying numbered 📖 read-pending badges](images/badges.png)
+
 ## What it does
 
 - **Toggle** read-pending on the focused agent (manual, both directions).
@@ -38,10 +40,11 @@ The watcher is therefore a small **companion daemon** (`readpending.py daemon`):
 ## Install
 
 ```sh
-herdr plugin link /path/to/herdr-plugins/readpending
+herdr plugin install rcosteira79/herdr-plugins/readpending
 ```
 
-Re-run after a `herdr update` — updates drop linked plugins.
+Or link a local checkout: `herdr plugin link /path/to/herdr-plugins/readpending`.
+Re-run `install`/`link` after a `herdr update` — updates drop plugins.
 
 ### Config (`~/.config/herdr/config.toml`)
 
@@ -55,7 +58,7 @@ sidebar row references them:
 rows = [["state_icon", "workspace", "tab", "$read"], ["agent"]]
 ```
 
-**2. Keybindings** (prefix is `ctrl+s` by default):
+**2. Keybindings**:
 
 ```toml
 [[keys.command]]
@@ -73,6 +76,8 @@ The toggle is also a `pane`-context action, but herdr does **not** surface plugi
 actions in its right-click pane menu — the keybinding is the trigger.
 
 ## Overlay list keys
+
+![The summon-anywhere read-pending overlay with the reordering queue](images/overlay.png)
 
 ```
 j / k or ↓ / ↑   move selection
