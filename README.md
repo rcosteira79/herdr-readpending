@@ -62,15 +62,22 @@ rows = [["state_icon", "workspace", "tab", "$read"], ["agent"]]
 
 ```toml
 [[keys.command]]
-key = "prefix+p"              # toggle read-pending on the focused agent
+key = "prefix+p"
 type = "shell"
 command = "herdr plugin action invoke toggle --plugin rcosteira.readpending"
+description = "toggle read-pending"
 
 [[keys.command]]
-key = "prefix+shift+p"        # open the read-pending overlay list
+key = "prefix+shift+p"
 type = "shell"
 command = "herdr plugin pane open --plugin rcosteira.readpending --entrypoint list --placement overlay"
+description = "read-pending list"
 ```
+
+Keep the `description` lines. A `#` comment documents the binding for you, but
+herdr never reads it — the help panel on `prefix+?` lists a binding with no
+`description` as `custom command`, which tells you nothing about what the key
+does.
 
 The toggle is also a `pane`-context action, but herdr does **not** surface plugin
 actions in its right-click pane menu — the keybinding is the trigger.
