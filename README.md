@@ -40,10 +40,10 @@ The watcher is therefore a small **companion daemon** (`readpending.py daemon`):
 ## Install
 
 ```sh
-herdr plugin install rcosteira79/herdr-plugins/readpending
+herdr plugin install rcosteira79/herdr-readpending
 ```
 
-Or link a local checkout: `herdr plugin link /path/to/herdr-plugins/readpending`.
+Or link a local checkout: `herdr plugin link /path/to/herdr-readpending`.
 Re-run `install`/`link` after a `herdr update` — updates drop plugins.
 
 ### Config (`~/.config/herdr/config.toml`)
