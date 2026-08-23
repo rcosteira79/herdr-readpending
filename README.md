@@ -116,3 +116,11 @@ To change the badge glyph/format, edit `GLYPH` / `_set_badge` in
 - herdr ≥ 0.7.4
 - Python 3 (stdlib only; uses `curses` for the overlay)
 - macOS or Linux
+
+## The other herdr plugins
+
+Each installs on its own; they share nothing but an author.
+
+- [**herdr-idle-shell-badge**](https://github.com/rcosteira79/herdr-idle-shell-badge) — Badges idle agents that still have a background shell running, so one that *looks* done but left a process alive isn't mistaken for finished.
+- [**herdr-account-switch**](https://github.com/rcosteira79/herdr-account-switch) — Hot-swap Claude Code / Codex logins without re-authenticating, with what is left on each account in the picker.
+- [**herdr-autocontinue**](https://github.com/rcosteira79/herdr-autocontinue) — Watch agents for usage-limit walls, badge the countdown to the reset, and re-prompt the agents you armed once the window reopens.
