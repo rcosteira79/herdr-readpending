@@ -19,23 +19,29 @@ reading it all — flag it as **read pending** so you come back.
   already focused on it does *not* self-clear (only an unfocused→focused
   transition clears).
 
-### Why there's a daemon
+### How auto-clear works
 
-herdr has **no plugin trigger that fires on focus** (the manifest `[[events]]`
-table parses but its hook allowlist accepts none of the pane/agent event names —
-they warn `unknown event`). So auto-clear-on-focus can't be declarative; it needs
-a running process. A herdr pane can't float across workspaces either, so the list
-is an overlay you summon and dismiss — which can't host a persistent watcher.
+herdr fires a plugin hook on focus, so auto-clear is declarative. The manifest
+asks for it:
 
-The watcher is therefore a small **companion daemon** (`readpending.py daemon`):
+```toml
+[[events]]
+on = "pane.focused"
+command = ["python3", "readpending.py", "on-focus"]
+```
 
-- started automatically when you mark an agent (and when you open the list);
-- polls agent state once a second and clears a pending pane the moment it gains
-  focus;
-- **self-exits** as soon as the queue is empty (so it only exists while you have
-  something pending), or if the herdr server goes away;
-- single-instance via a pidfile; talks only to the local herdr socket, no
-  network.
+herdr runs that on every focus change and names the pane that **gained** focus,
+in `HERDR_PANE_ID` and in the context blob's `focused_pane_id`. The command drops
+that pane from the queue if it is in it. No process runs between focus changes.
+
+Spell the event with dots. herdr's API schema lists the same kinds with
+underscores, and the manifest turns `pane_focused` down with `unknown event`.
+That spelling is why earlier versions of this plugin said no focus trigger
+existed and shipped a polling daemon instead. Verified on herdr 0.8.2, which is
+why `min_herdr_version` says 0.8.2.
+
+A missed event costs a badge that lingers, and the next focus of that pane
+clears it — so there is no safety poll and no daemon to supervise.
 
 ## Install
 
@@ -94,7 +100,9 @@ x                remove the selected agent from the queue
 q / esc          close
 ```
 
-Re-polls every second while open.
+Re-polls every second while open, to keep the labels and statuses current.
+That is display only: auto-clear is the focus hook's job, whether the list is
+open or not.
 
 ## How it works
 
@@ -104,8 +112,8 @@ Re-polls every second while open.
 - Badge: `herdr pane report-metadata <pane> --source rcosteira.readpending
   --token read=📖<n>`; cleared with `--clear-token read`. Position = 1-based
   index in the queue; every queue change renumbers all badges.
-- Auto-clear: the daemon (`daemon` subcommand) detects an unfocused→focused
-  transition on any queued pane and calls the shared remove path.
+- Auto-clear: herdr's `pane.focused` hook runs the `on-focus` subcommand, which
+  calls the shared remove path for the pane that gained focus.
 - Dead panes (closed) are pruned on the next toggle or list refresh.
 
 To change the badge glyph/format, edit `GLYPH` / `_set_badge` in
@@ -113,7 +121,7 @@ To change the badge glyph/format, edit `GLYPH` / `_set_badge` in
 
 ## Requirements
 
-- herdr ≥ 0.7.4
+- herdr ≥ 0.8.2 (for the `pane.focused` event hook that clears on focus)
 - Python 3 (stdlib only; uses `curses` for the overlay)
 - macOS or Linux
 

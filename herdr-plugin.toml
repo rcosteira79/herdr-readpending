@@ -1,7 +1,7 @@
 id = "rcosteira.readpending"
 name = "Read Pending"
 version = "0.1.0"
-min_herdr_version = "0.7.4"
+min_herdr_version = "0.8.2"
 description = "Mark agents you haven't finished reading. Numbered badge ($read) + a reorderable list pane. Auto-clears when you focus the agent."
 platforms = ["macos", "linux"]
 
@@ -27,8 +27,13 @@ title = "Read Pending"
 command = ["python3", "readpending.py", "ui"]
 placement = "overlay"
 
-# NO auto-clear-on-focus hook: herdr 0.7.4 parses [[events]] but its plugin-hook
-# allowlist accepts none of the pane/agent event names (pane_focused,
-# pane_agent_status_changed, ... all warn "unknown event"). Reactive behaviour
-# must be a companion process (poll loop or socket events.subscribe), not a
-# manifest hook. Auto-clear is handled by the list pane while it is open.
+# Auto-clear-on-focus. herdr runs this on every focus change, naming the pane
+# that gained focus; the command drops that pane from the queue if it is in it.
+#
+# Spell the event with dots. herdr's API schema lists the same kinds with
+# underscores, and the manifest turns `pane_focused` down with "unknown event".
+# That spelling is why an earlier note here said no pane event was accepted.
+# Verified on herdr 0.8.2, which is why min_herdr_version says 0.8.2.
+[[events]]
+on = "pane.focused"
+command = ["python3", "readpending.py", "on-focus"]

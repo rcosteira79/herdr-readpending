@@ -6,17 +6,22 @@ HERDR_PLUGIN_STATE_DIR/queue.json. Each queued pane carries a display token
 `read` = "<glyph><position>" set via `herdr pane report-metadata`; add `$read`
 to [ui.sidebar.agents] rows to see it. Position follows queue order.
 
-herdr has no plugin focus trigger, so auto-clear-on-focus lives in a companion
-daemon (readpending.py daemon): a poll loop that clears a pending pane the moment
-it gains focus. It is (re)started whenever an agent is marked, and self-exits
-once the queue is empty (or the herdr server goes away). The list pane is a
-summon-anywhere overlay for viewing/reordering — it does not own auto-clear.
+Auto-clear-on-focus is a herdr event hook. The manifest asks for
+`pane.focused`, and herdr runs `readpending.py on-focus` naming the pane that
+just gained focus. No daemon, no poll loop: the event *is* the transition the
+old daemon spent a second at a time looking for.
+
+Spell the event with dots. herdr's API schema lists the same kinds with
+underscores, and the manifest turns `pane_focused` down with "unknown event".
+
+The list pane is a summon-anywhere overlay for viewing and reordering. It does
+not own auto-clear.
 
 Subcommands:
   toggle       add/remove the focused agent (action, `pane` context)
   open-list    open the overlay list pane (global action)
   ui           the interactive overlay list pane
-  daemon       the auto-clear-on-focus watcher (spawned, detached)
+  on-focus     clear the pane that just gained focus (event hook)
 """
 import fcntl
 import json
@@ -34,8 +39,6 @@ STATE_DIR = os.environ.get("HERDR_PLUGIN_STATE_DIR") or os.path.expanduser(
 )
 QUEUE = os.path.join(STATE_DIR, "queue.json")
 LOCK = os.path.join(STATE_DIR, "queue.lock")
-PIDFILE = os.path.join(STATE_DIR, "daemon.pid")
-POLL_SECONDS = 1
 
 
 def herdr(*args):
@@ -148,20 +151,14 @@ def cmd_toggle():
     if not target:
         print("read-pending: no focused agent pane to toggle", file=sys.stderr)
         return 1
-    added = False
     with _Lock():
         queue = _load()
         if target in queue:
             queue.remove(target)
             _clear_badge(target)
-            queue = _reindex(queue)
         else:
             queue.append(target)
-            queue = _reindex(queue)
-            added = True
-        _save(queue)
-    if added:
-        _ensure_daemon()  # watch for focus so it auto-clears
+        _save(_reindex(queue))
     return 0
 
 
@@ -177,103 +174,30 @@ def _remove(pane_id):
     return False
 
 
-# ---- companion daemon (auto-clear-on-focus) -------------------------------
+# ---- auto-clear-on-focus (herdr event hook) -------------------------------
 
-def _pid_alive(pid):
-    if not pid:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # exists but not ours
-    return True
+def cmd_on_focus():
+    """Clear the pane that just gained focus. Run by herdr on `pane.focused`.
 
+    herdr names the pane *gaining* focus, in HERDR_PANE_ID and in the context
+    blob's focused_pane_id. Verified on herdr 0.8.2: focusing a new pane fires
+    once for it, and closing that pane fires again for the pane that gets focus
+    back. So the pane id in hand is the one the reader is now looking at.
 
-def _read_pid():
-    try:
-        return int(open(PIDFILE).read().strip())
-    except (FileNotFoundError, ValueError, OSError):
-        return None
+    Marking the pane you are already on does not clear it: no focus change
+    happened, so no event fires. Leaving and coming back clears it.
 
-
-def _ensure_daemon():
-    """Start the auto-clear daemon if one isn't already running."""
-    with _Lock():
-        if _pid_alive(_read_pid()):
-            return
-    script = os.path.abspath(__file__)
-    subprocess.Popen(
-        [sys.executable, script, "daemon"],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-        cwd=os.path.dirname(script),
-        env=os.environ.copy(),
-    )
-
-
-def cmd_daemon():
-    import time
-
-    # Single instance: claim the pidfile, or bail if a live daemon owns it.
-    with _Lock():
-        existing = _read_pid()
-        if _pid_alive(existing) and existing != os.getpid():
-            return 0
-        os.makedirs(STATE_DIR, exist_ok=True)
-        with open(PIDFILE, "w") as f:
-            f.write(str(os.getpid()))
-
-    prev_focus = {}
-    empty_polls = 0
-    server_fails = 0
-    try:
-        while True:
-            queue = _load()
-            if not queue:
-                empty_polls += 1
-                if empty_polls >= 3:  # nothing pending -> exit, restarted on next mark
-                    break
-                time.sleep(POLL_SECONDS)
-                continue
-            empty_polls = 0
-
-            agents = live_agents()
-            if agents is None:
-                server_fails += 1
-                if server_fails >= 5:  # herdr gone -> exit
-                    break
-                time.sleep(POLL_SECONDS)
-                continue
-            server_fails = 0
-
-            # Clear a pending pane the moment it transitions unfocused->focused.
-            for pid in queue:
-                foc = bool(agents.get(pid, {}).get("focused"))
-                was = prev_focus.get(pid)
-                if was is None:
-                    prev_focus[pid] = foc  # first sighting: seed, don't clear
-                else:
-                    if foc and not was:
-                        _remove(pid)
-                    prev_focus[pid] = foc
-            prev_focus = {k: v for k, v in prev_focus.items() if k in _load()}
-            time.sleep(POLL_SECONDS)
-    finally:
-        with _Lock():
-            if _read_pid() == os.getpid():
-                try:
-                    os.remove(PIDFILE)
-                except OSError:
-                    pass
+    A missed event costs a badge that lingers, and the next focus of that pane
+    clears it. That is why this needs no safety poll.
+    """
+    target = _resolve_target()
+    if not target:
+        return 0
+    _remove(target)
     return 0
 
 
 def cmd_open_list():
-    _ensure_daemon()
     res = herdr(
         "plugin", "pane", "open",
         "--plugin", PLUGIN_ID,
@@ -315,12 +239,11 @@ def _move(queue, index, delta):
 def cmd_ui():
     import curses
 
-    if _load():
-        _ensure_daemon()  # queue survived a restart the daemon didn't
-
     def run(stdscr):
         curses.curs_set(0)
-        stdscr.timeout(1000)  # refresh cadence (ms); auto-clear is the daemon's job
+        # Refresh cadence (ms) for the display only. Auto-clear is the
+        # `pane.focused` hook's job, whether this pane is open or not.
+        stdscr.timeout(1000)
         sel = 0
         while True:
             raw = live_agents()
@@ -388,7 +311,7 @@ def cmd_ui():
             elif ch in (ord("x"),):
                 _remove(queue[sel])
             elif ch in (curses.KEY_ENTER, 10, 13):
-                herdr("agent", "focus", queue[sel])  # daemon clears it on focus
+                herdr("agent", "focus", queue[sel])  # the focus hook clears it
                 return  # close the overlay after jumping
 
     curses.wrapper(run)
@@ -399,7 +322,7 @@ DISPATCH = {
     "toggle": cmd_toggle,
     "open-list": cmd_open_list,
     "ui": cmd_ui,
-    "daemon": cmd_daemon,
+    "on-focus": cmd_on_focus,
 }
 
 
