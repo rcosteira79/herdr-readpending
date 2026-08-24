@@ -27,8 +27,14 @@ title = "Read Pending"
 command = ["python3", "readpending.py", "ui"]
 placement = "overlay"
 
-# NO auto-clear-on-focus hook: herdr 0.7.4 parses [[events]] but its plugin-hook
-# allowlist accepts none of the pane/agent event names (pane_focused,
-# pane_agent_status_changed, ... all warn "unknown event"). Reactive behaviour
-# must be a companion process (poll loop or socket events.subscribe), not a
-# manifest hook. Auto-clear is handled by the list pane while it is open.
+# No auto-clear-on-focus hook yet, but herdr does support one. The earlier note
+# here said the plugin-hook allowlist accepts no pane event name. That was the
+# wrong spelling, not a missing feature: the allowlist wants dots, and herdr's
+# API schema lists the same kinds with underscores. `pane_focused` warns
+# "unknown event"; `pane.focused` loads and fires. Verified on herdr 0.8.2.
+#
+#   [[events]]
+#   on = "pane.focused"
+#   command = ["python3", "readpending.py", "clear"]
+#
+# Until that is wired, auto-clear is handled by the list pane while it is open.
