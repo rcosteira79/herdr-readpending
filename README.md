@@ -121,7 +121,7 @@ To change the badge glyph/format, edit `GLYPH` / `_set_badge` in
 
 ## Requirements
 
-- herdr ≥ 0.7.4
+- herdr ≥ 0.8.2 (for the `pane.focused` event hook that clears on focus)
 - Python 3 (stdlib only; uses `curses` for the overlay)
 - macOS or Linux
 
