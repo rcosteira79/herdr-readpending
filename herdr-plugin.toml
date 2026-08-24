@@ -1,7 +1,7 @@
 id = "rcosteira.readpending"
 name = "Read Pending"
 version = "0.1.0"
-min_herdr_version = "0.7.4"
+min_herdr_version = "0.8.2"
 description = "Mark agents you haven't finished reading. Numbered badge ($read) + a reorderable list pane. Auto-clears when you focus the agent."
 platforms = ["macos", "linux"]
 
@@ -27,14 +27,13 @@ title = "Read Pending"
 command = ["python3", "readpending.py", "ui"]
 placement = "overlay"
 
-# No auto-clear-on-focus hook yet, but herdr does support one. The earlier note
-# here said the plugin-hook allowlist accepts no pane event name. That was the
-# wrong spelling, not a missing feature: the allowlist wants dots, and herdr's
-# API schema lists the same kinds with underscores. `pane_focused` warns
-# "unknown event"; `pane.focused` loads and fires. Verified on herdr 0.8.2.
+# Auto-clear-on-focus. herdr runs this on every focus change, naming the pane
+# that gained focus; the command drops that pane from the queue if it is in it.
 #
-#   [[events]]
-#   on = "pane.focused"
-#   command = ["python3", "readpending.py", "clear"]
-#
-# Until that is wired, auto-clear is handled by the list pane while it is open.
+# Spell the event with dots. herdr's API schema lists the same kinds with
+# underscores, and the manifest turns `pane_focused` down with "unknown event".
+# That spelling is why an earlier note here said no pane event was accepted.
+# Verified on herdr 0.8.2, which is why min_herdr_version says 0.8.2.
+[[events]]
+on = "pane.focused"
+command = ["python3", "readpending.py", "on-focus"]
