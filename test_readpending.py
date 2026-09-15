@@ -124,6 +124,18 @@ moved = R._move(q, 0, +1)
 check("_move returns the new index", moved == 1, str(moved))
 check("_move swaps the entries in place", panes(q) == ["w1:pB", "w1:pA"], str(q))
 
+q = [{"pane": "w1:pA"}]
+check("a move with no room to go reports nothing moved",
+      R._reorder(q, 0, -1, {"w1:pA": {}}) is False, str(q))
+check("the queue is unchanged", panes(q) == ["w1:pA"], str(q))
+
+q = [{"pane": "w1:pA"}, {"pane": "w1:pB"}, {"pane": "w1:pC"}]
+agents = {"w1:pA": {}, "w1:pC": {}}  # w1:pB is queued but herdr no longer lists it
+check("a move steps over a pane herdr no longer lists",
+      R._reorder(q, 0, +1, agents) is True, str(q))
+check("the moved entry lands next to the visible neighbour",
+      panes(q) == ["w1:pC", "w1:pB", "w1:pA"], str(q))
+
 print("\nthe queue file loads as mark records")
 os.makedirs(R.STATE_DIR, exist_ok=True)
 with open(R.QUEUE, "w") as f:
@@ -134,8 +146,10 @@ check("a pre-mark queue loads as two records",
 check("every mark is unarmed", all(e["armed"] is False for e in loaded), str(loaded))
 check("every mark is 0", all(e["mark"] == 0 for e in loaded), str(loaded))
 
-first, second = R._load(), R._load()
-check("a pre-mark entry keeps the same mark across loads", first == second, str((first, second)))
+R._save(R._load())
+loaded = R._load()
+check("a pre-mark entry keeps mark 0 through a load-save-load round trip",
+      all(e["mark"] == 0 for e in loaded), str(loaded))
 
 R._save([R._entry("w1:pA", 7, True)])
 loaded = R._load()
@@ -168,6 +182,9 @@ with open(R.QUEUE, "w") as f:
 loaded = R._load()
 check("a bool mark is not read as an int",
       len(loaded) == 1 and loaded[0]["mark"] == 0, str(loaded))
+
+check("_next_mark tolerates a hand-built entry with no mark key",
+      R._next_mark([{"pane": "w1:pA"}]) > 0)
 
 print("\na fresh mark is unarmed and its id rises")
 for key in ("HERDR_ACTIVE_PANE_ID", "HERDR_PLUGIN_CONTEXT_JSON"):

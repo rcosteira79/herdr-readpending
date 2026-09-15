@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Read-pending marker for herdr agents.
 
-State: an ordered list of pane ids (the reading queue) in
-HERDR_PLUGIN_STATE_DIR/queue.json. Each queued pane carries a display token
-`read` = "<glyph><position>" set via `herdr pane report-metadata`; add `$read`
-to [ui.sidebar.agents] rows to see it. Position follows queue order.
+State: an ordered list of records (the reading queue) in
+HERDR_PLUGIN_STATE_DIR/queue.json. Each record holds a pane id, a mark id, and
+whether that mark is armed. A queue of bare pane ids written by an older
+version of this plugin still loads, as unarmed marks. Each queued pane carries
+a display token `read` = "<glyph><position>" set via `herdr pane
+report-metadata`; add `$read` to [ui.sidebar.agents] rows to see it. Position
+follows queue order.
 
 Auto-clear-on-focus is a herdr event hook. The manifest asks for
 `pane.focused`, and herdr runs `readpending.py on-focus` naming the pane that
@@ -58,8 +61,10 @@ def _entry(pane, mark=0, armed=False):
 def _next_mark(queue):
     """A mark id greater than every mark in `queue`. Wall-clock nanoseconds keep
     it rising across a queue that empties and forgets its marks; the floor keeps
-    it rising within one queue whatever the clock does."""
-    floor = max((e["mark"] for e in queue), default=0) + 1
+    it rising within one queue whatever the clock does. If the queue empties and
+    the wall clock then steps backwards, the next mark could still repeat an id
+    from before the queue emptied — the floor cannot see marks that are gone."""
+    floor = max((e.get("mark", 0) for e in queue), default=0) + 1
     return max(time.time_ns(), floor)
 
 
@@ -139,11 +144,21 @@ def _clear_badge(pane_id):
     )
 
 
-def _reindex(queue, prune=True):
+_UNFETCHED = object()  # _reindex's default: "no agents map was passed in"
+
+
+def _reindex(queue, prune=True, agents=_UNFETCHED):
     """Drop dead panes (if prune), then set each pane's badge to its 1-based
-    position. Returns the (possibly pruned) queue. Caller must persist it."""
+    position. Returns the (possibly pruned) queue. Caller must persist it.
+
+    Pass `agents` (e.g. already fetched via `live_agents()`) to reuse that
+    snapshot instead of calling `live_agents()` in here. A caller holding the
+    queue lock must fetch it before taking the lock, so the `herdr agent list`
+    subprocess call never runs while the lock is held. `agents=None` means the
+    caller found the server unreachable; that skips pruning, same as before."""
     if prune:
-        agents = live_agents()
+        if agents is _UNFETCHED:
+            agents = live_agents()
         if agents is not None:  # skip pruning if the server is unreachable
             queue = [e for e in queue if _pane(e) in agents]
     for i, entry in enumerate(queue, start=1):
@@ -183,6 +198,7 @@ def cmd_toggle():
     if not target:
         print("read-pending: no focused agent pane to toggle", file=sys.stderr)
         return 1
+    agents = live_agents()
     with _Lock():
         queue = _load()
         kept = [e for e in queue if _pane(e) != target]
@@ -191,18 +207,19 @@ def cmd_toggle():
             queue = kept
         else:
             queue.append(_entry(target, _next_mark(queue)))
-        _save(_reindex(queue))
+        _save(_reindex(queue, agents=agents))
     return 0
 
 
 def _remove(pane_id):
     """Locked: drop a pane from the queue, clear its badge, renumber."""
+    agents = live_agents()
     with _Lock():
         queue = _load()
         kept = [e for e in queue if _pane(e) != pane_id]
         if len(kept) != len(queue):
             _clear_badge(pane_id)
-            _save(_reindex(kept))
+            _save(_reindex(kept, agents=agents))
             return True
     return False
 
@@ -282,6 +299,30 @@ def _move(queue, index, delta):
     return index
 
 
+def _nearest_visible(queue, index, delta, agents):
+    """The index nearest to `index` in the direction of `delta` whose pane is
+    present in `agents`. None if the direction runs out first."""
+    j = index + delta
+    while 0 <= j < len(queue):
+        if _pane(queue[j]) in agents:
+            return j
+        j += delta
+    return None
+
+
+def _reorder(queue, index, delta, agents):
+    """Swap the entry at `index` with the nearest neighbour in the direction
+    of `delta` whose pane `agents` still lists, stepping over any entry
+    `agents` doesn't. Mutates `queue` in place and reports whether a swap
+    happened; `agents` only chooses which neighbour to swap with; it never
+    removes anything from `queue`."""
+    target = _nearest_visible(queue, index, delta, agents)
+    if target is None:
+        return False
+    _move(queue, index, target - index)
+    return True
+
+
 def cmd_ui():
     import curses
 
@@ -346,8 +387,8 @@ def cmd_ui():
                 with _Lock():
                     q = _load()
                     at = _index_of(q, picked)
-                    if at is not None:
-                        _move(q, at, +1 if ch == ord("J") else -1)
+                    delta = +1 if ch == ord("J") else -1
+                    if at is not None and _reorder(q, at, delta, agents):
                         _save(_reindex(q, prune=False))
                 seen = _index_of(_visible(q, agents), picked)
                 if seen is not None:
