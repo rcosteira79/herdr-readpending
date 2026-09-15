@@ -28,6 +28,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 PLUGIN_ID = os.environ.get("HERDR_PLUGIN_ID", "rcosteira.readpending")
 TOKEN = "read"
@@ -48,13 +49,37 @@ def herdr(*args):
     )
 
 
+def _entry(pane, mark=0, armed=False):
+    """One queued mark: the pane it marks, the id that tells this mark from the
+    next mark on the same pane, and whether the daemon has seen it unfocused."""
+    return {"pane": pane, "mark": int(mark), "armed": bool(armed)}
+
+
+def _next_mark(queue):
+    """A mark id greater than every mark in `queue`. Wall-clock nanoseconds keep
+    it rising across a queue that empties and forgets its marks; the floor keeps
+    it rising within one queue whatever the clock does."""
+    floor = max((e["mark"] for e in queue), default=0) + 1
+    return max(time.time_ns(), floor)
+
+
 def _load():
     try:
         with open(QUEUE) as f:
             data = json.load(f)
-        return data if isinstance(data, list) else []
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return []
+    if not isinstance(data, list):
+        return []
+    out = []
+    for item in data:
+        if isinstance(item, str) and item:
+            out.append(_entry(item))  # pre-mark format: unarmed, mark 0
+        elif isinstance(item, dict) and isinstance(item.get("pane"), str) and item["pane"]:
+            raw = item.get("mark", 0)
+            mark = raw if isinstance(raw, int) and not isinstance(raw, bool) else 0
+            out.append(_entry(item["pane"], mark, item.get("armed") is True))
+    return out
 
 
 def _save(queue):
@@ -66,8 +91,9 @@ def _save(queue):
 
 
 def _pane(entry):
-    """The pane id of a queue entry. Entries are records; a bare string is the
-    pre-mark format an installed plugin still holds on disk."""
+    """The pane id of a queue entry. `_load` normalises every entry it reads
+    into a record, so the bare-string fallback here only matters for
+    hand-built lists such as the ones the tests construct directly."""
     return entry.get("pane") if isinstance(entry, dict) else entry
 
 
@@ -159,11 +185,12 @@ def cmd_toggle():
         return 1
     with _Lock():
         queue = _load()
-        if target in queue:
-            queue.remove(target)
+        kept = [e for e in queue if _pane(e) != target]
+        if len(kept) != len(queue):
             _clear_badge(target)
+            queue = kept
         else:
-            queue.append(target)
+            queue.append(_entry(target, _next_mark(queue)))
         _save(_reindex(queue))
     return 0
 
