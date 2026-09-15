@@ -231,11 +231,31 @@ def _remove(pane_id):
 
 # ---- auto-clear-on-focus (poll daemon) ------------------------------------
 
+def _pid_alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but not ours
+    return True
+
+
 def _overlay_open():
-    """Is the read-pending overlay on screen? The overlay takes focus while it
-    is, so herdr reports every agent unfocused and the daemon must not arm
-    through that — checking the queue would silently change it."""
-    return os.path.exists(OVERLAY_MARKER)
+    """Is the read-pending overlay on screen? The marker names the pid that
+    wrote it, because a `finally` does not run on SIGKILL: a marker whose writer
+    is gone is stale, and a stale marker left to stand would switch arming off
+    for good."""
+    try:
+        pid = int(open(OVERLAY_MARKER).read().strip())
+    except (FileNotFoundError, ValueError, OSError):
+        pid = None
+    if not _pid_alive(pid):
+        _clear_overlay_marker()
+        return False
+    return True
 
 
 def _set_overlay_marker():
@@ -263,7 +283,7 @@ def _sample_focus(queue, agents):
     return sample
 
 
-def _apply_focus_sample(sample):
+def _apply_focus_sample(sample, arming):
     """Locked: arm every sampled mark seen unfocused, drop every armed mark seen
     focused, and drop every sampled mark whose pane herdr no longer lists. A
     mark whose id moved since the sample is a different mark on the same pane,
@@ -272,10 +292,17 @@ def _apply_focus_sample(sample):
     Arming, and only arming, stops while the overlay is on screen: the overlay
     holds focus itself, so every agent reads unfocused and arming through that
     would clear the mark on whichever agent the reader goes back to. Clearing an
-    already-armed mark and dropping a closed pane still run."""
+    already-armed mark and dropping a closed pane still run.
+
+    `arming` is the caller's marker read, which it takes BEFORE it samples, so
+    an overlay that closes mid-sample cannot arm a sample the overlay produced.
+    The read below catches the opposite case, an overlay that opened after the
+    caller read. Neither read closes the race: an overlay that opens and closes
+    between the two is still missed. They only narrow each window to the time
+    between the reads."""
     cleared = []
-    arming = not _overlay_open()  # read outside the lock: it is only a stat
     with _Lock():
+        arming = arming and not _overlay_open()  # also caught an overlay that opened mid-sample
         queue = _load()
         kept = []
         changed = False
