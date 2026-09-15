@@ -328,14 +328,46 @@ with open(R.OVERLAY_MARKER, "w") as f:
     f.write(str(gone))
 check("a marker holding a pid that is not running reads as closed",
       R._overlay_open() is False, str(gone))
-check("and the stale marker is removed", not os.path.exists(R.OVERLAY_MARKER))
+check("and the reader leaves that stale marker where it is",
+      os.path.exists(R.OVERLAY_MARKER))
 
 with open(R.OVERLAY_MARKER, "w") as f:
     f.write("not-a-pid")
 check("a marker holding junk reads as closed", R._overlay_open() is False)
-check("and the junk marker is removed", not os.path.exists(R.OVERLAY_MARKER))
+check("and the reader leaves that junk marker where it is",
+      os.path.exists(R.OVERLAY_MARKER))
 
+R._set_overlay_marker()
+check("writing a live marker over a stale one is what clears it",
+      R._overlay_open() is True)
+
+check("a pid that is not ours still reads as alive", R._pid_alive(1) is True)
+check("a negative pid reads as dead, never as a process group",
+      R._pid_alive(-1) is False)
+check("a pid too large for the OS to have issued reads as dead",
+      R._pid_alive(2 ** 64) is False)
+
+R._clear_overlay_marker()
 check("no marker at all reads as closed", R._overlay_open() is False)
+
+print("\nthe overlay marker is written in one step")
+with open(R.OVERLAY_MARKER, "w") as f:
+    f.write(str(gone))
+R._set_overlay_marker()
+with open(R.OVERLAY_MARKER) as f:
+    held = f.read().strip()
+check("a stale marker is replaced by one holding this process's pid",
+      held == str(os.getpid()), held)
+check("and no half-written marker is left beside it",
+      not os.path.exists(R.OVERLAY_MARKER + ".tmp"), str(os.listdir(STATE)))
+
+R._set_overlay_marker()
+with open(R.OVERLAY_MARKER) as f:
+    held = f.read().strip()
+check("writing it twice leaves one marker, still holding this pid",
+      held == str(os.getpid()), held)
+check("and still no temporary file beside that one either",
+      not os.path.exists(R.OVERLAY_MARKER + ".tmp"), str(os.listdir(STATE)))
 
 print("\nthe daemon decides to arm before it samples")
 R._clear_overlay_marker()
@@ -410,7 +442,7 @@ check("a crash in the overlay leaves no stale marker behind",
 
 curses.wrapper = real_wrapper
 check("the real curses.wrapper is back for every check below",
-      curses.wrapper is real_wrapper, str(curses.wrapper))
+      curses.wrapper.__module__ == "curses", str(curses.wrapper))
 
 print("\nthe daemon is gone")
 check("no daemon subcommand", "daemon" not in R.DISPATCH, str(list(R.DISPATCH)))

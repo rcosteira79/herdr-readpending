@@ -11,7 +11,8 @@ follows queue order.
 
 The overlay list holds a second state file, HERDR_PLUGIN_STATE_DIR/overlay.open,
 for as long as it is on screen. The overlay takes focus itself, so auto-clear
-arms no mark while that file exists.
+arms no mark while that file exists. The file names the pid that wrote it, so a
+marker whose pid is gone reads as closed and arming goes on.
 
 Auto-clear-on-focus is a herdr event hook. The manifest asks for
 `pane.focused`, and herdr runs `readpending.py on-focus` naming the pane that
@@ -232,12 +233,14 @@ def _remove(pane_id):
 # ---- auto-clear-on-focus (poll daemon) ------------------------------------
 
 def _pid_alive(pid):
-    if not pid:
+    if not pid or pid < 0:  # a negative pid would probe a process GROUP
         return False
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
+    except OverflowError:
+        return False  # too large for a pid; no process could hold it
     except PermissionError:
         return True  # exists but not ours
     return True
@@ -246,22 +249,23 @@ def _pid_alive(pid):
 def _overlay_open():
     """Is the read-pending overlay on screen? The marker names the pid that
     wrote it, because a `finally` does not run on SIGKILL: a marker whose writer
-    is gone is stale, and a stale marker left to stand would switch arming off
-    for good."""
+    is gone reads as closed. This only reads. A stale marker is left where it
+    is — deleting it here would race a fresh overlay writing a live one, and it
+    decides nothing, because a dead pid reads closed every time."""
     try:
-        pid = int(open(OVERLAY_MARKER).read().strip())
+        with open(OVERLAY_MARKER) as f:
+            pid = int(f.read().strip())
     except (FileNotFoundError, ValueError, OSError):
         pid = None
-    if not _pid_alive(pid):
-        _clear_overlay_marker()
-        return False
-    return True
+    return _pid_alive(pid)
 
 
 def _set_overlay_marker():
     os.makedirs(STATE_DIR, exist_ok=True)
-    with open(OVERLAY_MARKER, "w") as f:
+    tmp = OVERLAY_MARKER + ".tmp"
+    with open(tmp, "w") as f:
         f.write(str(os.getpid()))
+    os.replace(tmp, OVERLAY_MARKER)
 
 
 def _clear_overlay_marker():
