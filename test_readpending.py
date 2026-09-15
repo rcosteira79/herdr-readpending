@@ -552,6 +552,27 @@ R.HERDR = _real_bin
 R.herdr = fake_herdr
 
 
+print("\nherdr output that will not decode reads as a failed call")
+# subprocess.run(text=True) decodes with the locale encoding and errors='strict'.
+# A byte the locale cannot decode raised UnicodeDecodeError, which is a
+# ValueError -- so the OSError handler missed it and the daemon died on the poll
+# that hit it. Agent names and cwd tails come back through `agent list`.
+R.herdr = REAL_HERDR
+_real_bin = R.HERDR
+R.HERDR = "/bin/sh"
+_raised = None
+try:
+    _res = R.herdr("-c", r"printf '\377\376'")
+except Exception as _exc:
+    _raised = _exc
+    _res = None
+check("undecodable output does not raise out of herdr", _raised is None, repr(_raised))
+check("it reports a return code instead", _res is not None and _res.returncode is not None,
+      str(_res))
+R.HERDR = _real_bin
+R.herdr = fake_herdr
+
+
 print("\nlive_agents survives every shape a herdr response can take")
 # The pane map was built outside the try, so a well-formed response carrying the
 # wrong type raised out of live_agents -- and out of the poll loop body, which

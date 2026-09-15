@@ -57,12 +57,20 @@ def herdr(*args):
     at all — missing, replaced mid-update, a bad HERDR_BIN_PATH inherited by the
     daemon — raises OSError, and unhandled that escapes live_agents and kills
     the daemon on the poll that hits it, with stderr going to DEVNULL. Report it
-    as a failed call instead, so the five-consecutive-failures exit covers it."""
+    as a failed call instead, so the five-consecutive-failures exit covers it.
+
+    Two things keep "never raises" true. `errors="replace"` stops a byte the
+    locale cannot decode from raising UnicodeDecodeError out of the decode
+    itself — agent names and cwd tails come back through `agent list`, and the
+    daemon inherits whatever locale the herdr session had. The handler catches
+    ValueError as well as OSError, because UnicodeDecodeError is a ValueError
+    and an OSError-only handler let it through."""
     try:
         return subprocess.run(
-            [HERDR, *args], capture_output=True, text=True, check=False
+            [HERDR, *args], capture_output=True, text=True,
+            errors="replace", check=False,
         )
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         return subprocess.CompletedProcess([HERDR, *args], 127, "", str(exc))
 
 
