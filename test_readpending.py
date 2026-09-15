@@ -296,31 +296,35 @@ check("no badge is cleared on a pane that is gone",
       not any("--clear-token" in a for a in CALLS), str(CALLS))
 check("nothing is reported cleared for it", cleared == [], str(cleared))
 
+# These four pass arming=False, and _apply_focus_sample computes
+# `arming and not _overlay_open()`, so a marker on disk cannot change any of
+# their outcomes: the flag has already decided. They used to set the marker and
+# name it in their titles, which read as claims the marker was doing the work.
+# The marker's own effect is checked below, where arming=True is passed with a
+# marker on disk and the mark still does not arm.
 R._save([R._entry("w1:pA", 5)])
-R._set_overlay_marker()
 del CALLS[:]
 cleared = R._apply_focus_sample({"w1:pA": (5, True, False)}, False)
 loaded = R._load()
-check("the overlay marker stops an unfocused mark being armed",
+check("arming off stops an unfocused mark being armed",
       panes(loaded) == ["w1:pA"] and loaded[0]["armed"] is False, str(loaded))
-check("and writes no badge while the overlay is on screen",
+check("and nothing changed, so no badge is written",
       cleared == [] and CALLS == [], str(CALLS))
 
 R._save([R._entry("w1:pA", 5, True)])
 cleared = R._apply_focus_sample({"w1:pA": (5, True, True)}, False)
-check("an already-armed mark still clears while the overlay is on screen",
+check("an already-armed mark still clears with arming off",
       cleared == ["w1:pA"] and panes(R._load()) == [], str(cleared))
 
 R._save([R._entry("w1:pA", 5, True)])
 R._apply_focus_sample({"w1:pA": (5, False, False)}, False)
-check("a closed pane is still dropped while the overlay is on screen",
+check("a closed pane is still dropped with arming off",
       panes(R._load()) == [], str(R._load()))
 
-R._clear_overlay_marker()
 R._save([R._entry("w1:pA", 5)])
 R._apply_focus_sample({"w1:pA": (5, True, False)}, True)
 loaded = R._load()
-check("with the overlay gone the same sample arms the mark",
+check("with arming on the same sample arms the mark",
       loaded and loaded[0]["armed"] is True, str(loaded))
 
 
