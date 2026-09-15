@@ -496,6 +496,17 @@ R.cmd_toggle()
 check("emptying the queue starts nothing, there is nothing left to watch",
       SPAWNS == [], str(SPAWNS))
 
+print("\nthe manifest wakes the daemon on both hooks")
+manifest = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "herdr-plugin.toml"), encoding="utf-8").read()
+check('on = "pane.focused" in manifest', 'on = "pane.focused"' in manifest)
+check('on = "pane.agent_status_changed" in manifest',
+      'on = "pane.agent_status_changed"' in manifest)
+check('"ensure-daemon" in manifest', "ensure-daemon" in manifest)
+check('"on-focus" not in manifest', "on-focus" not in manifest)
+check('min_herdr_version = "0.8.2" in manifest',
+      'min_herdr_version = "0.8.2"' in manifest)
+
 shutil.rmtree(STATE, ignore_errors=True)
 print("\n%s — %d of the checks failed"
       % ("FAILED" if FAILED else "PASSED", len(FAILED)))

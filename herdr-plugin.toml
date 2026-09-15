@@ -27,13 +27,20 @@ title = "Read Pending"
 command = ["python3", "readpending.py", "ui"]
 placement = "overlay"
 
-# Auto-clear-on-focus. herdr runs this on every focus change, naming the pane
-# that gained focus; the command drops that pane from the queue if it is in it.
+# Daemon wake-up hooks. Neither clears anything — the poll daemon does that.
+# Both hooks have one job: ensure the daemon stays alive. pane.focused restarts
+# a dead daemon at the moment the reader opens an agent inside a workspace.
+# pane.agent_status_changed is the most frequent trigger herdr publishes
+# reliably, because herdr publishes no startup or lifecycle event a manifest
+# can hook. See docs/adr/0001-poll-for-focus-not-events.md.
 #
 # Spell the event with dots. herdr's API schema lists the same kinds with
 # underscores, and the manifest turns `pane_focused` down with "unknown event".
-# That spelling is why an earlier note here said no pane event was accepted.
 # Verified on herdr 0.8.2, which is why min_herdr_version says 0.8.2.
 [[events]]
 on = "pane.focused"
-command = ["python3", "readpending.py", "on-focus"]
+command = ["python3", "readpending.py", "ensure-daemon"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["python3", "readpending.py", "ensure-daemon"]

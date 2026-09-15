@@ -431,7 +431,7 @@ def cmd_daemon():
     return 0
 
 
-# ---- auto-clear-on-focus (herdr event hook) -------------------------------
+# ---- the event-hook entrypoint --------------------------------------------
 
 def cmd_ensure_daemon():
     """Both manifest hooks run this. It removes nothing: it only restarts a dead
