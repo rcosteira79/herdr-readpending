@@ -27,7 +27,7 @@ Subcommands:
   toggle       add/remove the focused agent (action, `pane` context)
   open-list    open the overlay list pane (global action)
   ui           the interactive overlay list pane
-  on-focus     clear the pane that just gained focus (event hook)
+  ensure-daemon  make sure the auto-clear daemon is alive (event hook)
   daemon       the auto-clear watcher (spawned, detached)
 """
 import fcntl
@@ -212,7 +212,11 @@ def cmd_toggle():
             queue = kept
         else:
             queue.append(_entry(target, _next_mark(queue)))
-        _save(_reindex(queue, agents=agents))
+        queue = _reindex(queue, agents=agents)
+        _save(queue)
+        pending = bool(queue)
+    if pending:
+        _ensure_daemon()
     return 0
 
 
@@ -429,28 +433,15 @@ def cmd_daemon():
 
 # ---- auto-clear-on-focus (herdr event hook) -------------------------------
 
-def cmd_on_focus():
-    """Clear the pane that just gained focus. Run by herdr on `pane.focused`.
-
-    herdr names the pane *gaining* focus, in HERDR_PANE_ID and in the context
-    blob's focused_pane_id. Verified on herdr 0.8.2: focusing a new pane fires
-    once for it, and closing that pane fires again for the pane that gets focus
-    back. So the pane id in hand is the one the reader is now looking at.
-
-    Marking the pane you are already on does not clear it: no focus change
-    happened, so no event fires. Leaving and coming back clears it.
-
-    A missed event costs a badge that lingers, and the next focus of that pane
-    clears it. That is why this needs no safety poll.
-    """
-    target = _resolve_target()
-    if not target:
-        return 0
-    _remove(target)
+def cmd_ensure_daemon():
+    """Both manifest hooks run this. It removes nothing: it only restarts a dead
+    daemon. See docs/adr/0001-poll-for-focus-not-events.md."""
+    _ensure_daemon()
     return 0
 
 
 def cmd_open_list():
+    _ensure_daemon()
     res = herdr(
         "plugin", "pane", "open",
         "--plugin", PLUGIN_ID,
@@ -529,10 +520,13 @@ def _reorder(queue, index, delta, agents):
 def cmd_ui():
     import curses
 
+    if _load():
+        _ensure_daemon()
+
     def run(stdscr):
         curses.curs_set(0)
         # Refresh cadence (ms) for the display only. Auto-clear is the
-        # `pane.focused` hook's job, whether this pane is open or not.
+        # poll daemon's job, whether this pane is open or not.
         stdscr.timeout(1000)
         sel = 0
         while True:
@@ -599,7 +593,11 @@ def cmd_ui():
             elif ch in (ord("x"),):
                 _remove(_pane(queue[sel]))
             elif ch in (curses.KEY_ENTER, 10, 13):
-                herdr("agent", "focus", _pane(queue[sel]))  # the focus hook clears it
+                # Jumping here does not clear the mark by itself: an unarmed
+                # mark (one made on the agent the reader was already on)
+                # only clears once the daemon has seen this pane unfocused
+                # and then focused again, i.e. on the next leave-and-return.
+                herdr("agent", "focus", _pane(queue[sel]))
                 return  # close the overlay after jumping
 
     # The overlay takes focus, so the daemon arms nothing while this exists.
@@ -617,7 +615,7 @@ DISPATCH = {
     "toggle": cmd_toggle,
     "open-list": cmd_open_list,
     "ui": cmd_ui,
-    "on-focus": cmd_on_focus,
+    "ensure-daemon": cmd_ensure_daemon,
     "daemon": cmd_daemon,
 }
 

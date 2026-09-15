@@ -57,57 +57,6 @@ def fake_spawn():
 R._spawn_daemon = fake_spawn
 
 
-def focus_event(pane_id, queue):
-    """One `pane.focused` hook run, shaped the way herdr shapes it."""
-    del CALLS[:]
-    R._save(queue)
-    for key in ("HERDR_ACTIVE_PANE_ID", "HERDR_PANE_ID", "HERDR_PLUGIN_CONTEXT_JSON"):
-        os.environ.pop(key, None)
-    if pane_id is not None:
-        os.environ["HERDR_PANE_ID"] = pane_id
-    R.cmd_on_focus()
-    return R._load()
-
-
-print("\nfocusing a pending pane clears it")
-left = focus_event("w1:pA", ["w1:pA", "w1:pB"])
-check("the focused pane is gone", "w1:pA" not in panes(left), str(left))
-check("the other pane stays", panes(left) == ["w1:pB"], str(left))
-check("its badge was cleared",
-      any(a[:2] == ("pane", "report-metadata") and "--clear-token" in a for a in CALLS),
-      str(CALLS))
-
-print("\nthe rest of the queue is renumbered")
-R._save(["w1:pA", "w1:pB", "w1:pC"])
-os.environ["HERDR_PANE_ID"] = "w1:pA"
-del CALLS[:]
-R.cmd_on_focus()
-badges = [a for a in CALLS if "--token" in a]
-check("two badges rewritten", len(badges) == 2, str(badges))
-check("they read 1 and 2",
-      all(any("=%s%d" % (R.GLYPH, n) in part for part in a) for n, a in enumerate(badges, 1)),
-      str(badges))
-
-print("\nfocusing a pane that is not pending changes nothing")
-left = focus_event("w1:pZ", ["w1:pA"])
-check("the queue is untouched", panes(left) == ["w1:pA"], str(left))
-check("no badge was cleared",
-      not any("--clear-token" in a for a in CALLS), str(CALLS))
-
-print("\nan event naming no pane is ignored")
-left = focus_event(None, ["w1:pA"])
-check("the queue is untouched", panes(left) == ["w1:pA"], str(left))
-check("it exits cleanly", True)
-
-print("\nthe context blob is used when HERDR_PANE_ID is absent")
-del CALLS[:]
-R._save(["w1:pA"])
-os.environ.pop("HERDR_PANE_ID", None)
-os.environ["HERDR_PLUGIN_CONTEXT_JSON"] = json.dumps({"focused_pane_id": "w1:pA"})
-R.cmd_on_focus()
-check("the pane named in the context is cleared", panes(R._load()) == [], str(R._load()))
-os.environ.pop("HERDR_PLUGIN_CONTEXT_JSON", None)
-
 print("\nthe queue is read through one accessor")
 R._save([{"pane": "w1:pA"}, {"pane": "w1:pB"}])
 del CALLS[:]
@@ -455,7 +404,8 @@ check("the real curses.wrapper is back for every check below",
 
 print("\nthe daemon is back")
 check("the daemon subcommand exists", "daemon" in R.DISPATCH, str(list(R.DISPATCH)))
-check("on-focus is dispatchable", "on-focus" in R.DISPATCH, str(list(R.DISPATCH)))
+check("ensure-daemon is dispatchable", "ensure-daemon" in R.DISPATCH, str(list(R.DISPATCH)))
+check("on-focus is gone", "on-focus" not in R.DISPATCH, str(list(R.DISPATCH)))
 src = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "readpending.py"), encoding="utf-8").read()
 check("the daemon spawns a background process", "Popen" in src)
@@ -503,6 +453,48 @@ check("but it is not ours to remove, so it is still there",
 
 if os.path.exists(R.PIDFILE):
     os.remove(R.PIDFILE)
+
+print("\nthe hooks only wake the daemon")
+R._save([R._entry("w1:pA", 5)])
+if os.path.exists(R.PIDFILE):
+    os.remove(R.PIDFILE)
+del SPAWNS[:]
+R.cmd_ensure_daemon()
+loaded = R._load()
+check("the hook wakes the daemon", len(SPAWNS) == 1, str(SPAWNS))
+check("the hook removes nothing", panes(loaded) == ["w1:pA"], str(loaded))
+check("the mark it left behind is unarmed",
+      loaded and loaded[0]["armed"] is False, str(loaded))
+
+R._save([])
+if os.path.exists(R.PIDFILE):
+    os.remove(R.PIDFILE)
+del SPAWNS[:]
+for key in ("HERDR_ACTIVE_PANE_ID", "HERDR_PLUGIN_CONTEXT_JSON"):
+    os.environ.pop(key, None)
+os.environ["HERDR_PANE_ID"] = "w1:pA"
+R.cmd_toggle()
+check("marking an agent starts the watcher", len(SPAWNS) == 1, str(SPAWNS))
+
+R._save([R._entry("w1:pA", 5), R._entry("w1:pB", 6)])
+if os.path.exists(R.PIDFILE):
+    os.remove(R.PIDFILE)
+del SPAWNS[:]
+os.environ["HERDR_PANE_ID"] = "w1:pA"
+R.cmd_toggle()
+loaded = R._load()
+check("unmarking one of two pending agents still starts the watcher",
+      len(SPAWNS) == 1, str(SPAWNS))
+check("the one left pending is still queued", panes(loaded) == ["w1:pB"], str(loaded))
+
+R._save([R._entry("w1:pA", 5)])
+if os.path.exists(R.PIDFILE):
+    os.remove(R.PIDFILE)
+del SPAWNS[:]
+os.environ["HERDR_PANE_ID"] = "w1:pA"
+R.cmd_toggle()
+check("emptying the queue starts nothing, there is nothing left to watch",
+      SPAWNS == [], str(SPAWNS))
 
 shutil.rmtree(STATE, ignore_errors=True)
 print("\n%s — %d of the checks failed"
