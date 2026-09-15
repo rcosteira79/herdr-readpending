@@ -47,6 +47,15 @@ def fake_herdr(*args):
 
 R.herdr = fake_herdr
 
+SPAWNS = []
+
+
+def fake_spawn():
+    SPAWNS.append(1)
+
+
+R._spawn_daemon = fake_spawn
+
 
 def focus_event(pane_id, queue):
     """One `pane.focused` hook run, shaped the way herdr shapes it."""
@@ -444,13 +453,34 @@ curses.wrapper = real_wrapper
 check("the real curses.wrapper is back for every check below",
       curses.wrapper.__module__ == "curses", str(curses.wrapper))
 
-print("\nthe daemon is gone")
-check("no daemon subcommand", "daemon" not in R.DISPATCH, str(list(R.DISPATCH)))
+print("\nthe daemon is back")
+check("the daemon subcommand exists", "daemon" in R.DISPATCH, str(list(R.DISPATCH)))
 check("on-focus is dispatchable", "on-focus" in R.DISPATCH, str(list(R.DISPATCH)))
 src = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "readpending.py"), encoding="utf-8").read()
-check("nothing spawns a background process", "Popen" not in src)
-check("no poll interval is left behind", "POLL_SECONDS" not in src)
+check("the daemon spawns a background process", "Popen" in src)
+check("a poll interval is defined", "POLL_SECONDS" in src)
+body = src[src.index("def cmd_daemon"):]
+check("the daemon reads the overlay marker before it samples focus",
+      body.index("arming = not _overlay_open()") < body.index("agents = live_agents()"))
+
+print("\nonly one daemon claims the pidfile")
+if os.path.exists(R.PIDFILE):
+    os.remove(R.PIDFILE)
+del SPAWNS[:]
+R._ensure_daemon()
+check("no pidfile -> the daemon is spawned", len(SPAWNS) == 1, str(SPAWNS))
+
+open(R.PIDFILE, "w").write(str(os.getpid()))
+del SPAWNS[:]
+R._ensure_daemon()
+check("a live pid in the pidfile -> the daemon is not spawned",
+      SPAWNS == [], str(SPAWNS))
+
+open(R.PIDFILE, "w").write("not-a-pid")
+del SPAWNS[:]
+R._ensure_daemon()
+check("a garbage pidfile -> the daemon is spawned", len(SPAWNS) == 1, str(SPAWNS))
 
 shutil.rmtree(STATE, ignore_errors=True)
 print("\n%s — %d of the checks failed"

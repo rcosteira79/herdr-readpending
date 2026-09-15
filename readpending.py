@@ -14,13 +14,11 @@ for as long as it is on screen. The overlay takes focus itself, so auto-clear
 arms no mark while that file exists. The file names the pid that wrote it, so a
 marker whose pid is gone reads as closed and arming goes on.
 
-Auto-clear-on-focus is a herdr event hook. The manifest asks for
-`pane.focused`, and herdr runs `readpending.py on-focus` naming the pane that
-just gained focus. No daemon, no poll loop: the event *is* the transition the
-old daemon spent a second at a time looking for.
-
-Spell the event with dots. herdr's API schema lists the same kinds with
-underscores, and the manifest turns `pane_focused` down with "unknown event".
+herdr delivers no plugin event when focus moves between workspaces, so
+auto-clear-on-focus runs a companion poll daemon (readpending.py daemon)
+instead: it polls `herdr agent list` once a second and clears a pending pane
+the moment it gains focus. See docs/adr/0001-poll-for-focus-not-events.md for
+why the event hook alone cannot carry this.
 
 The list pane is a summon-anywhere overlay for viewing and reordering. It does
 not own auto-clear.
@@ -30,6 +28,7 @@ Subcommands:
   open-list    open the overlay list pane (global action)
   ui           the interactive overlay list pane
   on-focus     clear the pane that just gained focus (event hook)
+  daemon       the auto-clear watcher (spawned, detached)
 """
 import fcntl
 import json
@@ -232,6 +231,10 @@ def _remove(pane_id):
 
 # ---- auto-clear-on-focus (poll daemon) ------------------------------------
 
+PIDFILE = os.path.join(STATE_DIR, "daemon.pid")
+POLL_SECONDS = 1
+
+
 def _pid_alive(pid):
     if not pid or pid < 0:  # a negative pid would probe a process GROUP
         return False
@@ -244,6 +247,13 @@ def _pid_alive(pid):
     except PermissionError:
         return True  # exists but not ours
     return True
+
+
+def _read_pid():
+    try:
+        return int(open(PIDFILE).read().strip())
+    except (FileNotFoundError, ValueError, OSError):
+        return None
 
 
 def _overlay_open():
@@ -332,6 +342,72 @@ def _apply_focus_sample(sample, arming):
         if changed:
             _save(_reindex(kept, prune=False))
     return cleared
+
+
+def _spawn_daemon():
+    script = os.path.abspath(__file__)
+    subprocess.Popen(
+        [sys.executable, script, "daemon"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        cwd=os.path.dirname(script),
+        env=os.environ.copy(),
+    )
+
+
+def _ensure_daemon():
+    """Start the auto-clear daemon if one isn't already running."""
+    with _Lock():
+        if _pid_alive(_read_pid()):
+            return
+    _spawn_daemon()
+
+
+def cmd_daemon():
+    # Single instance: claim the pidfile, or bail if a live daemon owns it.
+    with _Lock():
+        existing = _read_pid()
+        if _pid_alive(existing) and existing != os.getpid():
+            return 0
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(PIDFILE, "w") as f:
+            f.write(str(os.getpid()))
+
+    empty_polls = 0
+    server_fails = 0
+    try:
+        while True:
+            queue = _load()
+            if not queue:
+                empty_polls += 1
+                if empty_polls >= 3:  # nothing pending -> exit, restarted on next mark
+                    break
+                time.sleep(POLL_SECONDS)
+                continue
+            empty_polls = 0
+
+            arming = not _overlay_open()  # read before the sample; see task 5b
+            agents = live_agents()
+            if agents is None:
+                server_fails += 1
+                if server_fails >= 5:  # herdr gone -> exit
+                    break
+                time.sleep(POLL_SECONDS)
+                continue
+            server_fails = 0
+
+            _apply_focus_sample(_sample_focus(queue, agents), arming)
+            time.sleep(POLL_SECONDS)
+    finally:
+        with _Lock():
+            if _read_pid() == os.getpid():
+                try:
+                    os.remove(PIDFILE)
+                except OSError:
+                    pass
+    return 0
 
 
 # ---- auto-clear-on-focus (herdr event hook) -------------------------------
@@ -525,6 +601,7 @@ DISPATCH = {
     "open-list": cmd_open_list,
     "ui": cmd_ui,
     "on-focus": cmd_on_focus,
+    "daemon": cmd_daemon,
 }
 
 
