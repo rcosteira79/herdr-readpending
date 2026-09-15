@@ -94,12 +94,6 @@ daemon`.
   still alive, may unblock later, and you'd end up with two watchers on one
   queue.
 
-"Press the toggle key" buys the same thing in every case above: the toggle
-starts a watcher whenever it leaves anything pending, so it works on any
-agent, marked or not, and opening the read-pending list does the same.
-Neither starts anything on an empty queue — correctly, since there is
-nothing to watch.
-
 - **Case four, `overlay.open` reused.** A different pidfile, the same reuse
   limit. `HERDR_PLUGIN_STATE_DIR/overlay.open` names the pid of the overlay
   process; if the OS hands that pid to an unrelated process, the daemon
@@ -112,6 +106,17 @@ nothing to watch.
   delete the file if it is not a `readpending.py ui`. The plugin never
   cleans this up on its own — the reader only ever deletes a marker by
   opening the overlay again, which overwrites it.
+
+"Press the toggle key" buys the same thing in every case above: the toggle
+starts a watcher whenever it leaves anything pending, so it works on any
+agent, marked or not. Note that on an *unmarked* agent it leaves a new mark
+behind, which you press again to remove. Opening the read-pending list also
+starts a watcher, and the two entry points differ on an empty queue: the
+`open-list` action starts one regardless, while the overlay pane itself
+starts one only when something is already queued. Either way a watcher with
+nothing to watch exits after three empty polls, so the difference costs a
+few seconds of an idle process and nothing else.
+
 
 One caveat no pidfile surgery fixes: the daemon writes badges through herdr
 while it holds the queue lock, so if a *badge* call is what hangs, the
@@ -175,8 +180,12 @@ q / esc          close
 ```
 
 Re-polls every second while open, to keep the labels and statuses current.
-That is display only: auto-clear is the daemon's job, whether the list is
-open or not.
+That is display only — auto-clear is the daemon's job, not this pane's — but
+the list is not quite inert either: the overlay takes focus itself, so while
+it is on screen the daemon arms no *new* mark. An already-armed mark still
+clears, and a closed pane is still dropped. Without that, every queued mark
+would arm while you read the list, and the mark on whichever agent you went
+back to would clear unread — checking the queue would change it.
 
 ## How it works
 
@@ -185,6 +194,11 @@ open or not.
   `{"pane": "<pane id>", "armed": <bool>, "mark": <id>}` — mutated under an
   `flock`. A queue of bare pane ids written by an older version of this
   plugin still loads, as unarmed marks.
+- Overlay marker: `HERDR_PLUGIN_STATE_DIR/overlay.open` exists for as long as
+  the list pane is on screen, and names the pid that wrote it. The daemon arms
+  nothing while a live marker is there; a marker whose pid is gone reads as
+  closed. Written atomically, and removed by the overlay process on its way
+  out.
 - Badge: `herdr pane report-metadata <pane> --source rcosteira.readpending
   --token read=📖<n>`; cleared with `--clear-token read`. Position = 1-based
   index in the queue; every queue change renumbers all badges.
@@ -200,9 +214,13 @@ To change the badge glyph/format, edit `GLYPH` / `_set_badge` in
 
 ## Requirements
 
-- herdr ≥ 0.8.2 — the version a manifest event hook was confirmed to load
-  on. Both `pane.focused` and `pane.agent_status_changed` stay in the
-  manifest, but only to wake the auto-clear daemon; see
+- herdr ≥ 0.9.0. A manifest event hook was confirmed to load on 0.8.2, but
+  that was `pane.focused` alone; `pane.agent_status_changed` is only
+  evidenced on 0.9.0. herdr turns an unknown event name down with "unknown
+  event" and rejects the *manifest*, not just the one hook, so a 0.8.2 user
+  would risk losing the plugin outright rather than one degraded hook. The
+  floor tracks the weaker-evidenced event deliberately. Both hooks stay in
+  the manifest, and both exist only to wake the auto-clear daemon; see
   [How auto-clear works](#how-auto-clear-works).
 - Python 3 (stdlib only; uses `curses` for the overlay)
 - macOS or Linux

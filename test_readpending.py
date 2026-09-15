@@ -45,13 +45,16 @@ def fake_herdr(*args):
     return Done()
 
 
+REAL_HERDR = R.herdr  # the real subprocess wrapper, for the missing-binary check
 R.herdr = fake_herdr
 
 SPAWNS = []
 
 
 def fake_spawn():
-    SPAWNS.append(1)
+    # Record whether the overlay marker was already on disk at the spawn,
+    # so the order cmd_ui does its work in is asserted, not assumed.
+    SPAWNS.append(os.path.exists(R.OVERLAY_MARKER))
 
 
 R._spawn_daemon = fake_spawn
@@ -504,8 +507,81 @@ check('on = "pane.agent_status_changed" in manifest',
       'on = "pane.agent_status_changed"' in manifest)
 check('"ensure-daemon" in manifest', "ensure-daemon" in manifest)
 check('"on-focus" not in manifest', "on-focus" not in manifest)
-check('min_herdr_version = "0.8.2" in manifest',
-      'min_herdr_version = "0.8.2"' in manifest)
+check('min_herdr_version = "0.9.0" in manifest',
+      'min_herdr_version = "0.9.0"' in manifest)
+
+
+print("\nthe overlay claims the marker before it does anything else")
+# The overlay pane already holds focus when herdr spawns this process, so every
+# agent reads unfocused from the moment it starts. Anything cmd_ui does before
+# it writes the marker is done with arming still switched on — and one of those
+# things starts the daemon.
+R._clear_overlay_marker()
+if os.path.exists(R.PIDFILE):
+    os.remove(R.PIDFILE)
+R._save([R._entry("w1:pA", 5)])
+del SPAWNS[:]
+curses.wrapper = fake_wrapper
+R.cmd_ui()
+check("the marker was already written when cmd_ui started the daemon",
+      SPAWNS == [True], str(SPAWNS))
+check("and it is gone once the overlay exits",
+      not os.path.exists(R.OVERLAY_MARKER))
+curses.wrapper = real_wrapper
+
+
+print("\na herdr binary that will not launch reads as unreachable")
+# subprocess.run raises FileNotFoundError when the binary is missing; check=False
+# only suppresses a non-zero exit. Unhandled, it escapes live_agents and kills
+# the daemon on the poll that hits it.
+R.herdr = REAL_HERDR
+_real_bin = R.HERDR
+R.HERDR = os.path.join(STATE, "no-such-herdr-binary")
+_raised = False
+try:
+    _res = R.herdr("agent", "list")
+except OSError:
+    _raised = True
+    _res = None
+check("calling a missing herdr binary does not raise", not _raised)
+check("it reports a non-zero return code", _res is not None and _res.returncode != 0,
+      str(_res))
+check("and live_agents reads that as unreachable, not as an empty session",
+      R.live_agents() is None)
+R.HERDR = _real_bin
+R.herdr = fake_herdr
+
+
+print("\nthe daemon loop exits on both of its conditions")
+# Safe to run cmd_daemon here: with no poll interval every branch returns in
+# milliseconds. Without this the whole loop was covered by substring searches.
+_real_poll = R.POLL_SECONDS
+R.POLL_SECONDS = 0
+
+R._save([])
+with open(R.PIDFILE, "w") as f:
+    f.write(str(os.getpid()))
+check("an empty queue exits the loop", R.cmd_daemon() == 0)
+check("and the daemon gave up its pidfile", not os.path.exists(R.PIDFILE))
+
+R._save([R._entry("w1:pA", 5)])
+_real_live = R.live_agents
+R.live_agents = lambda: None
+check("five consecutive herdr failures exit the loop", R.cmd_daemon() == 0)
+check("and that pidfile is gone too", not os.path.exists(R.PIDFILE))
+R.live_agents = _real_live
+
+with open(R.PIDFILE, "w") as f:
+    f.write("1")  # pid 1 is init: alive, and not us
+R._save([R._entry("w1:pA", 5)])
+check("a live daemon already owns the pidfile, so a second one bails out",
+      R.cmd_daemon() == 0)
+check("and the running daemon's pidfile is left alone", R._read_pid() == 1)
+os.remove(R.PIDFILE)
+
+R.POLL_SECONDS = _real_poll
+R._save([])
+
 
 shutil.rmtree(STATE, ignore_errors=True)
 print("\n%s — %d of the checks failed"

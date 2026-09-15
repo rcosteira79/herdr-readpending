@@ -1,7 +1,7 @@
 id = "rcosteira.readpending"
 name = "Read Pending"
 version = "0.1.0"
-min_herdr_version = "0.8.2"
+min_herdr_version = "0.9.0"
 description = "Mark agents you haven't finished reading. Numbered badge ($read) + a reorderable list pane. Auto-clears when you focus the agent."
 platforms = ["macos", "linux"]
 
@@ -35,8 +35,14 @@ placement = "overlay"
 # can hook. See docs/adr/0001-poll-for-focus-not-events.md.
 #
 # Spell the event with dots. herdr's API schema lists the same kinds with
-# underscores, and the manifest turns `pane_focused` down with "unknown event".
-# Verified on herdr 0.8.2, which is why min_herdr_version says 0.8.2.
+# underscores, and the manifest turns `pane_focused` down with "unknown event"
+# — and it turns down the manifest, not just the one hook.
+#
+# That rejection is why min_herdr_version says 0.9.0 rather than 0.8.2. A
+# manifest event hook was confirmed to load on 0.8.2, but that was one hook:
+# pane.focused. pane.agent_status_changed is only evidenced on 0.9.0, and an
+# unknown event name there would cost a 0.8.2 user the whole plugin, not one
+# degraded hook. The floor tracks the weaker-evidenced event, deliberately.
 [[events]]
 on = "pane.focused"
 command = ["python3", "readpending.py", "ensure-daemon"]

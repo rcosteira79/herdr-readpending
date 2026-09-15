@@ -51,10 +51,19 @@ OVERLAY_MARKER = os.path.join(STATE_DIR, "overlay.open")
 
 
 def herdr(*args):
-    """Run the herdr CLI; return CompletedProcess (never raises on non-zero)."""
-    return subprocess.run(
-        [HERDR, *args], capture_output=True, text=True, check=False
-    )
+    """Run the herdr CLI; return CompletedProcess (never raises).
+
+    `check=False` only suppresses a non-zero exit. A binary that will not launch
+    at all — missing, replaced mid-update, a bad HERDR_BIN_PATH inherited by the
+    daemon — raises OSError, and unhandled that escapes live_agents and kills
+    the daemon on the poll that hits it, with stderr going to DEVNULL. Report it
+    as a failed call instead, so the five-consecutive-failures exit covers it."""
+    try:
+        return subprocess.run(
+            [HERDR, *args], capture_output=True, text=True, check=False
+        )
+    except OSError as exc:
+        return subprocess.CompletedProcess([HERDR, *args], 127, "", str(exc))
 
 
 def _entry(pane, mark=0, armed=False):
@@ -409,7 +418,7 @@ def cmd_daemon():
                 continue
             empty_polls = 0
 
-            arming = not _overlay_open()  # read before the sample; see task 5b
+            arming = not _overlay_open()  # before the sample, never after it
             agents = live_agents()
             if agents is None:
                 server_fails += 1
@@ -518,93 +527,97 @@ def _reorder(queue, index, delta, agents):
 
 
 def cmd_ui():
-    import curses
-
-    if _load():
-        _ensure_daemon()
-
-    def run(stdscr):
-        curses.curs_set(0)
-        # Refresh cadence (ms) for the display only. Auto-clear is the
-        # poll daemon's job, whether this pane is open or not.
-        stdscr.timeout(1000)
-        sel = 0
-        while True:
-            raw = live_agents()
-            agents = raw if raw is not None else {}
-            # Don't prune the display when the server is briefly unreachable.
-            queue = _load() if raw is None else _visible(_load(), agents)
-            if sel >= len(queue):
-                sel = max(0, len(queue) - 1)
-
-            stdscr.erase()
-            h, w = stdscr.getmaxyx()
-            header = "READ PENDING"
-            hint = "j/k select · J/K reorder · enter jump · x remove · q quit"
-            stdscr.addnstr(0, 0, header, w - 1, curses.A_BOLD)
-            if h > 1:
-                stdscr.addnstr(1, 0, hint, w - 1, curses.A_DIM)
-            if not queue:
-                if h > 3:
-                    stdscr.addnstr(3, 0, "(nothing pending)", w - 1, curses.A_DIM)
-            else:
-                for i, entry in enumerate(queue):
-                    pane_id = _pane(entry)
-                    row = i + 3
-                    if row >= h:
-                        break
-                    info = agents.get(pane_id, {"pane_id": pane_id})
-                    tail = _cwd_tail(info)
-                    status = info.get("agent_status", "")
-                    line = f"{i + 1:>2}. {_label(info)}"
-                    if status:
-                        line += f"  [{status}]"
-                    if tail:
-                        line += f"  ({tail})"
-                    attr = curses.A_REVERSE if i == sel else curses.A_NORMAL
-                    stdscr.addnstr(row, 0, line.ljust(w - 1), w - 1, attr)
-            stdscr.refresh()
-
-            try:
-                ch = stdscr.getch()
-            except KeyboardInterrupt:
-                return
-            if ch == -1:
-                continue  # timeout -> refresh
-            if ch in (ord("q"), 27):
-                return
-            if not queue:
-                continue
-            if ch in (ord("j"), curses.KEY_DOWN):
-                sel = min(len(queue) - 1, sel + 1)
-            elif ch in (ord("k"), curses.KEY_UP):
-                sel = max(0, sel - 1)
-            elif ch in (ord("J"), ord("K")):
-                picked = _pane(queue[sel])
-                with _Lock():
-                    q = _load()
-                    at = _index_of(q, picked)
-                    delta = +1 if ch == ord("J") else -1
-                    if at is not None and _reorder(q, at, delta, agents):
-                        _save(_reindex(q, prune=False))
-                seen = _index_of(_visible(q, agents), picked)
-                if seen is not None:
-                    sel = seen
-            elif ch in (ord("x"),):
-                _remove(_pane(queue[sel]))
-            elif ch in (curses.KEY_ENTER, 10, 13):
-                # Jumping here does not clear the mark by itself: an unarmed
-                # mark (one made on the agent the reader was already on)
-                # only clears once the daemon has seen this pane unfocused
-                # and then focused again, i.e. on the next leave-and-return.
-                herdr("agent", "focus", _pane(queue[sel]))
-                return  # close the overlay after jumping
-
-    # The overlay takes focus, so the daemon arms nothing while this exists.
-    # It has to go on the way out of every exit, crash included: a marker left
-    # behind would switch arming off for the rest of the session.
+    # Claim the marker first, before this process does anything else. The
+    # overlay pane already holds focus, so every agent reads unfocused from
+    # the moment herdr spawns us — work done above this line is done with
+    # arming still on, and _ensure_daemon below can start the very daemon
+    # that would then arm the whole queue off the overlay's own focus.
+    # It has to go on the way out of every exit, crash included: a marker
+    # left behind would switch arming off for the rest of the session.
     _set_overlay_marker()
     try:
+        import curses
+
+        if _load():
+            _ensure_daemon()
+
+        def run(stdscr):
+            curses.curs_set(0)
+            # Refresh cadence (ms) for the display only. Auto-clear is the
+            # poll daemon's job, whether this pane is open or not.
+            stdscr.timeout(1000)
+            sel = 0
+            while True:
+                raw = live_agents()
+                agents = raw if raw is not None else {}
+                # Don't prune the display when the server is briefly unreachable.
+                queue = _load() if raw is None else _visible(_load(), agents)
+                if sel >= len(queue):
+                    sel = max(0, len(queue) - 1)
+
+                stdscr.erase()
+                h, w = stdscr.getmaxyx()
+                header = "READ PENDING"
+                hint = "j/k select · J/K reorder · enter jump · x remove · q quit"
+                stdscr.addnstr(0, 0, header, w - 1, curses.A_BOLD)
+                if h > 1:
+                    stdscr.addnstr(1, 0, hint, w - 1, curses.A_DIM)
+                if not queue:
+                    if h > 3:
+                        stdscr.addnstr(3, 0, "(nothing pending)", w - 1, curses.A_DIM)
+                else:
+                    for i, entry in enumerate(queue):
+                        pane_id = _pane(entry)
+                        row = i + 3
+                        if row >= h:
+                            break
+                        info = agents.get(pane_id, {"pane_id": pane_id})
+                        tail = _cwd_tail(info)
+                        status = info.get("agent_status", "")
+                        line = f"{i + 1:>2}. {_label(info)}"
+                        if status:
+                            line += f"  [{status}]"
+                        if tail:
+                            line += f"  ({tail})"
+                        attr = curses.A_REVERSE if i == sel else curses.A_NORMAL
+                        stdscr.addnstr(row, 0, line.ljust(w - 1), w - 1, attr)
+                stdscr.refresh()
+
+                try:
+                    ch = stdscr.getch()
+                except KeyboardInterrupt:
+                    return
+                if ch == -1:
+                    continue  # timeout -> refresh
+                if ch in (ord("q"), 27):
+                    return
+                if not queue:
+                    continue
+                if ch in (ord("j"), curses.KEY_DOWN):
+                    sel = min(len(queue) - 1, sel + 1)
+                elif ch in (ord("k"), curses.KEY_UP):
+                    sel = max(0, sel - 1)
+                elif ch in (ord("J"), ord("K")):
+                    picked = _pane(queue[sel])
+                    with _Lock():
+                        q = _load()
+                        at = _index_of(q, picked)
+                        delta = +1 if ch == ord("J") else -1
+                        if at is not None and _reorder(q, at, delta, agents):
+                            _save(_reindex(q, prune=False))
+                    seen = _index_of(_visible(q, agents), picked)
+                    if seen is not None:
+                        sel = seen
+                elif ch in (ord("x"),):
+                    _remove(_pane(queue[sel]))
+                elif ch in (curses.KEY_ENTER, 10, 13):
+                    # Jumping here does not clear the mark by itself: an unarmed
+                    # mark (one made on the agent the reader was already on)
+                    # only clears once the daemon has seen this pane unfocused
+                    # and then focused again, i.e. on the next leave-and-return.
+                    herdr("agent", "focus", _pane(queue[sel]))
+                    return  # close the overlay after jumping
+
         curses.wrapper(run)
     finally:
         _clear_overlay_marker()
