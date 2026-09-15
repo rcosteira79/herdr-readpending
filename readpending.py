@@ -16,9 +16,11 @@ marker whose pid is gone reads as closed and arming goes on.
 
 herdr delivers no plugin event when focus moves between workspaces, so
 auto-clear-on-focus runs a companion poll daemon (readpending.py daemon)
-instead: it polls `herdr agent list` once a second and clears a pending pane
-the moment it gains focus. See docs/adr/0001-poll-for-focus-not-events.md for
-why the event hook alone cannot carry this.
+instead: it polls `herdr agent list` once a second, arms a mark once it sees
+that pane unfocused, and clears an armed mark the moment its pane gains focus.
+Marking the pane you are already looking at therefore clears nothing until you
+leave it and come back. See docs/adr/0001-poll-for-focus-not-events.md for why
+the event hook alone cannot carry this.
 
 The list pane is a summon-anywhere overlay for viewing and reordering. It does
 not own auto-clear.
