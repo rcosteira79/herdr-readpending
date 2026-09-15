@@ -28,6 +28,10 @@ def check(name, ok, detail=""):
         FAILED.append(name)
 
 
+def panes(q):
+    return [R._pane(e) for e in q]
+
+
 class Done:
     returncode = 0
     stdout = ""
@@ -57,8 +61,8 @@ def focus_event(pane_id, queue):
 
 print("\nfocusing a pending pane clears it")
 left = focus_event("w1:pA", ["w1:pA", "w1:pB"])
-check("the focused pane is gone", "w1:pA" not in left, str(left))
-check("the other pane stays", left == ["w1:pB"], str(left))
+check("the focused pane is gone", "w1:pA" not in panes(left), str(left))
+check("the other pane stays", panes(left) == ["w1:pB"], str(left))
 check("its badge was cleared",
       any(a[:2] == ("pane", "report-metadata") and "--clear-token" in a for a in CALLS),
       str(CALLS))
@@ -76,13 +80,13 @@ check("they read 1 and 2",
 
 print("\nfocusing a pane that is not pending changes nothing")
 left = focus_event("w1:pZ", ["w1:pA"])
-check("the queue is untouched", left == ["w1:pA"], str(left))
+check("the queue is untouched", panes(left) == ["w1:pA"], str(left))
 check("no badge was cleared",
       not any("--clear-token" in a for a in CALLS), str(CALLS))
 
 print("\nan event naming no pane is ignored")
 left = focus_event(None, ["w1:pA"])
-check("the queue is untouched", left == ["w1:pA"], str(left))
+check("the queue is untouched", panes(left) == ["w1:pA"], str(left))
 check("it exits cleanly", True)
 
 print("\nthe context blob is used when HERDR_PANE_ID is absent")
@@ -91,8 +95,124 @@ R._save(["w1:pA"])
 os.environ.pop("HERDR_PANE_ID", None)
 os.environ["HERDR_PLUGIN_CONTEXT_JSON"] = json.dumps({"focused_pane_id": "w1:pA"})
 R.cmd_on_focus()
-check("the pane named in the context is cleared", R._load() == [], str(R._load()))
+check("the pane named in the context is cleared", panes(R._load()) == [], str(R._load()))
 os.environ.pop("HERDR_PLUGIN_CONTEXT_JSON", None)
+
+print("\nthe queue is read through one accessor")
+R._save([{"pane": "w1:pA"}, {"pane": "w1:pB"}])
+del CALLS[:]
+R._reindex(R._load(), prune=False)
+badges = [a for a in CALLS if "--token" in a]
+check("two badges rewritten", len(badges) == 2, str(badges))
+check("they read 1 and 2",
+      all(any("=%s%d" % (R.GLYPH, n) in part for part in a) for n, a in enumerate(badges, 1)),
+      str(badges))
+R._save([{"pane": "w1:pA"}, {"pane": "w1:pB"}])
+check("remove of a queued pane returns True", R._remove("w1:pA") is True)
+check("the other pane remains", panes(R._load()) == ["w1:pB"], str(R._load()))
+check("remove of an absent pane returns False", R._remove("w1:pZ") is False)
+check("the queue is unchanged", panes(R._load()) == ["w1:pB"], str(R._load()))
+visible = R._visible([{"pane": "w1:pA"}, {"pane": "w1:pB"}], {"w1:pB": {}})
+check("_visible keeps only panes herdr still knows about",
+      panes(visible) == ["w1:pB"], str(visible))
+check("_index_of finds the pane's current slot",
+      R._index_of([{"pane": "w1:pA"}, {"pane": "w1:pB"}], "w1:pB") == 1)
+check("_index_of returns None when the pane is gone",
+      R._index_of([{"pane": "w1:pA"}], "w1:pZ") is None)
+q = [{"pane": "w1:pA"}, {"pane": "w1:pB"}]
+moved = R._move(q, 0, +1)
+check("_move returns the new index", moved == 1, str(moved))
+check("_move swaps the entries in place", panes(q) == ["w1:pB", "w1:pA"], str(q))
+
+q = [{"pane": "w1:pA"}]
+check("a move with no room to go reports nothing moved",
+      R._reorder(q, 0, -1, {"w1:pA": {}}) is False, str(q))
+check("the queue is unchanged", panes(q) == ["w1:pA"], str(q))
+
+q = [{"pane": "w1:pA"}, {"pane": "w1:pB"}, {"pane": "w1:pC"}]
+agents = {"w1:pA": {}, "w1:pC": {}}  # w1:pB is queued but herdr no longer lists it
+check("a move steps over a pane herdr no longer lists",
+      R._reorder(q, 0, +1, agents) is True, str(q))
+check("the moved entry lands next to the visible neighbour",
+      panes(q) == ["w1:pC", "w1:pB", "w1:pA"], str(q))
+
+print("\nthe queue file loads as mark records")
+os.makedirs(R.STATE_DIR, exist_ok=True)
+with open(R.QUEUE, "w") as f:
+    json.dump(["w1:pA", "w1:pB"], f)
+loaded = R._load()
+check("a pre-mark queue loads as two records",
+      panes(loaded) == ["w1:pA", "w1:pB"], str(loaded))
+check("every mark is unarmed", all(e["armed"] is False for e in loaded), str(loaded))
+check("every mark is 0", all(e["mark"] == 0 for e in loaded), str(loaded))
+
+R._save(R._load())
+loaded = R._load()
+check("a pre-mark entry keeps mark 0 through a load-save-load round trip",
+      all(e["mark"] == 0 for e in loaded), str(loaded))
+
+R._save([R._entry("w1:pA", 7, True)])
+loaded = R._load()
+check("a saved mark round-trips its id and armed state",
+      len(loaded) == 1 and loaded[0]["mark"] == 7 and loaded[0]["armed"] is True,
+      str(loaded))
+
+with open(R.QUEUE, "w") as f:
+    json.dump(["w1:pA", 3, {"armed": True}, {"pane": "w1:pB", "mark": "x"}], f)
+loaded = R._load()
+check("the bare int and the paneless record are dropped",
+      panes(loaded) == ["w1:pA", "w1:pB"], str(loaded))
+check("an unreadable mark falls back to 0",
+      loaded[1]["mark"] == 0, str(loaded))
+
+with open(R.QUEUE, "w") as f:
+    json.dump([{"pane": "w1:pA", "armed": "no"}], f)
+loaded = R._load()
+check("a junk armed value does not arm the mark",
+      len(loaded) == 1 and loaded[0]["armed"] is False, str(loaded))
+
+with open(R.QUEUE, "w") as f:
+    json.dump([{"pane": "w1:pA", "mark": 1e999}], f)
+loaded = R._load()
+check("an out-of-range mark does not raise and falls back to 0",
+      len(loaded) == 1 and loaded[0]["mark"] == 0, str(loaded))
+
+with open(R.QUEUE, "w") as f:
+    json.dump([{"pane": "w1:pA", "mark": True}], f)
+loaded = R._load()
+check("a bool mark is not read as an int",
+      len(loaded) == 1 and loaded[0]["mark"] == 0, str(loaded))
+
+check("_next_mark tolerates a hand-built entry with no mark key",
+      R._next_mark([{"pane": "w1:pA"}]) > 0)
+
+print("\na fresh mark is unarmed and its id rises")
+for key in ("HERDR_ACTIVE_PANE_ID", "HERDR_PLUGIN_CONTEXT_JSON"):
+    os.environ.pop(key, None)
+os.environ["HERDR_PANE_ID"] = "w1:pA"
+
+R._save([])
+R.cmd_toggle()
+loaded = R._load()
+check("a fresh mark is queued", len(loaded) == 1, str(loaded))
+check("it is unarmed", loaded and loaded[0]["armed"] is False, str(loaded))
+check("its mark is positive", loaded and loaded[0]["mark"] > 0, str(loaded))
+
+R._save([R._entry("w1:pB", 2 ** 62)])
+R.cmd_toggle()
+loaded = R._load()
+new = next((e for e in loaded if e["pane"] == "w1:pA"), None)
+check("a mark below the floor is bumped above it",
+      new is not None and new["mark"] > 2 ** 62, str(loaded))
+
+del CALLS[:]
+R.cmd_toggle()
+loaded = R._load()
+check("the already-queued pane is gone, not duplicated",
+      panes(loaded) == ["w1:pB"], str(loaded))
+check("its badge was cleared",
+      any(a[:2] == ("pane", "report-metadata") and "--clear-token" in a for a in CALLS),
+      str(CALLS))
 
 print("\nthe daemon is gone")
 check("no daemon subcommand", "daemon" not in R.DISPATCH, str(list(R.DISPATCH)))
