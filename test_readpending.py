@@ -482,6 +482,28 @@ del SPAWNS[:]
 R._ensure_daemon()
 check("a garbage pidfile -> the daemon is spawned", len(SPAWNS) == 1, str(SPAWNS))
 
+print("\nthe daemon gives up the pidfile under the lock")
+R._save([])
+open(R.PIDFILE, "w").write(str(os.getpid()))
+check("an idle queue exits", R._exit_if_idle() is True)
+check("its pidfile is gone", os.path.exists(R.PIDFILE) is False)
+
+R._save([R._entry("w1:pA", 5)])
+open(R.PIDFILE, "w").write(str(os.getpid()))
+check("a mark landed while deciding -> the daemon does not exit",
+      R._exit_if_idle() is False)
+check("its pidfile is still there", os.path.exists(R.PIDFILE) is True)
+
+R._save([])
+open(R.PIDFILE, "w").write("1")
+check("a pidfile that is not ours -> the daemon still exits",
+      R._exit_if_idle() is True)
+check("but it is not ours to remove, so it is still there",
+      os.path.exists(R.PIDFILE) is True)
+
+if os.path.exists(R.PIDFILE):
+    os.remove(R.PIDFILE)
+
 shutil.rmtree(STATE, ignore_errors=True)
 print("\n%s — %d of the checks failed"
       % ("FAILED" if FAILED else "PASSED", len(FAILED)))

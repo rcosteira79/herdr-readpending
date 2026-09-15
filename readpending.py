@@ -365,6 +365,21 @@ def _ensure_daemon():
     _spawn_daemon()
 
 
+def _exit_if_idle():
+    """Locked: is the queue still empty? Then stop watching and give up the
+    pidfile inside the same lock the toggle takes, so a mark landing now waits
+    for this lock, finds no pid, and starts a fresh daemon."""
+    with _Lock():
+        if _load():
+            return False
+        if _read_pid() == os.getpid():
+            try:
+                os.remove(PIDFILE)
+            except OSError:
+                pass
+        return True
+
+
 def cmd_daemon():
     # Single instance: claim the pidfile, or bail if a live daemon owns it.
     with _Lock():
@@ -382,8 +397,10 @@ def cmd_daemon():
             queue = _load()
             if not queue:
                 empty_polls += 1
-                if empty_polls >= 3:  # nothing pending -> exit, restarted on next mark
-                    break
+                if empty_polls >= 3:
+                    if _exit_if_idle():
+                        break
+                    empty_polls = 0
                 time.sleep(POLL_SECONDS)
                 continue
             empty_polls = 0
