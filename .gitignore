@@ -2,3 +2,7 @@ __pycache__/
 *.py[cod]
 *.log
 .DS_Store
+
+# ACE scaffolding: design record, state, and plan folders are local-only
+.ace/
+docs/plans/
