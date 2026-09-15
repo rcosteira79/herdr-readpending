@@ -34,6 +34,28 @@ def panes(q):
     return [R._pane(e) for e in q]
 
 
+def bounded(fn, seconds=5):
+    """Run fn under an alarm and return what it returned, or the TimeoutError.
+
+    cmd_daemon runs below with POLL_SECONDS = 0, so a regression in an exit
+    condition is a busy loop rather than a slow one. Unbounded, check() never
+    runs: there is no FAIL line and no exit code, only a hung run at 100% CPU.
+    Returning the error instead of raising it lets the caller's check report a
+    failure the ordinary way."""
+    def _expired(signum, frame):
+        raise TimeoutError("did not return within %ds" % seconds)
+
+    previous = signal.signal(signal.SIGALRM, _expired)
+    signal.alarm(seconds)
+    try:
+        return fn()
+    except TimeoutError as exc:
+        return exc
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+
 class Done:
     returncode = 0
     stdout = ""
@@ -682,27 +704,41 @@ R.herdr = _saved_fake
 print("\nthe daemon loop exits on both of its conditions")
 # Safe to run cmd_daemon here: with no poll interval every branch returns in
 # milliseconds. Without this the whole loop was covered by substring searches.
+# Each call goes through bounded(), so a regression in an exit condition fails a
+# check instead of hanging the run at 100% CPU with no output.
+def _never_returns():
+    while True:
+        pass
+
+
+_stuck = bounded(_never_returns, seconds=1)
+check("the alarm guard turns a loop that never returns into a failure",
+      isinstance(_stuck, TimeoutError), repr(_stuck))
+
 _real_poll = R.POLL_SECONDS
 R.POLL_SECONDS = 0
 
 R._save([])
 with open(R.PIDFILE, "w") as f:
     f.write(str(os.getpid()))
-check("an empty queue exits the loop", R.cmd_daemon() == 0)
+_got = bounded(R.cmd_daemon)
+check("an empty queue exits the loop", _got == 0, str(_got))
 check("and the daemon gave up its pidfile", not os.path.exists(R.PIDFILE))
 
 R._save([R._entry("w1:pA", 5)])
 _real_live = R.live_agents
 R.live_agents = lambda: None
-check("five consecutive herdr failures exit the loop", R.cmd_daemon() == 0)
+_got = bounded(R.cmd_daemon)
+check("five consecutive herdr failures exit the loop", _got == 0, str(_got))
 check("and that pidfile is gone too", not os.path.exists(R.PIDFILE))
 R.live_agents = _real_live
 
 with open(R.PIDFILE, "w") as f:
     f.write("1")  # pid 1 is init: alive, and not us
 R._save([R._entry("w1:pA", 5)])
+_got = bounded(R.cmd_daemon)
 check("a live daemon already owns the pidfile, so a second one bails out",
-      R.cmd_daemon() == 0)
+      _got == 0, str(_got))
 check("and the running daemon's pidfile is left alone", R._read_pid() == 1)
 os.remove(R.PIDFILE)
 
@@ -733,7 +769,8 @@ R._save([R._entry("w1:pA", 5)])
 R.live_agents = _peek_daemon
 with open(R.PIDFILE, "w") as f:
     f.write(str(os.getpid()))
-check("the daemon loop still exits", R.cmd_daemon() == 0)
+_got = bounded(R.cmd_daemon)
+check("the daemon loop still exits", _got == 0, str(_got))
 R.live_agents = _real_live
 check("SIGTERM is handled inside the daemon loop, not left at its default",
       _seen.get("daemon") not in (signal.SIG_DFL, None), repr(_seen.get("daemon")))
