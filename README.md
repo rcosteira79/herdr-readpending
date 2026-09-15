@@ -21,27 +21,101 @@ reading it all — flag it as **read pending** so you come back.
 
 ### How auto-clear works
 
-herdr fires a plugin hook on focus, so auto-clear is declarative. The manifest
-asks for it:
+herdr delivers a plugin focus event only when focus moves between panes
+**inside one workspace**; move focus **between workspaces** and it delivers
+nothing — not `pane.focused`, not `tab.focused`, not `workspace.focused`.
+Every agent here owns a workspace, so ordinary agent switching is a
+workspace change and reaches no hook at all. See
+[`docs/adr/0001-poll-for-focus-not-events.md`](docs/adr/0001-poll-for-focus-not-events.md)
+for the measurement, and for how this plugin already got this wrong once:
+commit `6b1fa56` deleted a working poll daemon in favour of the hook and
+verified it live before shipping — but that check moved focus with `herdr
+agent focus`, a socket call that *does* emit the event. The keyboard doesn't.
+The feature was dead in normal use for three weeks while the code looked
+correct.
+
+Auto-clear is therefore a companion daemon, `readpending.py daemon`, spawned
+detached the first time it's needed. It polls `herdr agent list` once a
+second and tracks each queued pane's focus itself: it **arms** a mark once
+it has seen that pane unfocused, and **clears** the mark when the pane comes
+back into focus — which is why marking the agent you're already reading does
+not self-clear; the daemon has to see you leave first.
+
+Both manifest hooks exist only to keep that daemon alive, never to clear
+anything:
 
 ```toml
 [[events]]
 on = "pane.focused"
-command = ["python3", "readpending.py", "on-focus"]
+command = ["python3", "readpending.py", "ensure-daemon"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["python3", "readpending.py", "ensure-daemon"]
 ```
 
-herdr runs that on every focus change and names the pane that **gained** focus,
-in `HERDR_PANE_ID` and in the context blob's `focused_pane_id`. The command drops
-that pane from the queue if it is in it. No process runs between focus changes.
+`ensure-daemon` restarts the daemon if it isn't already running and does
+nothing else. `pane.focused` catches the moment the reader opens an agent
+inside a workspace; `pane.agent_status_changed` is the most frequent event
+herdr publishes reliably otherwise — a quiet session still gets a wake-up
+whenever any agent's status changes.
 
-Spell the event with dots. herdr's API schema lists the same kinds with
-underscores, and the manifest turns `pane_focused` down with `unknown event`.
-That spelling is why earlier versions of this plugin said no focus trigger
-existed and shipped a polling daemon instead. Verified on herdr 0.8.2, which is
-why `min_herdr_version` says 0.8.2.
+**How long can a dead daemon stay dead?** Three limits, not one — the hooks
+shorten the dead window, they do not close it, and none of this is
+self-healing.
 
-A missed event costs a badge that lingers, and the next focus of that pane
-clears it — so there is no safety poll and no daemon to supervise.
+**One.** Both hooks fire only on activity. A fully quiet session — no focus
+change, no agent status change — has no upper bound on how long a dead
+daemon stays dead.
+
+**Two.** The single-instance claim is a pidfile plus `os.kill(pid, 0)`,
+which proves only that *some* process holds that pid. If the daemon is
+killed abruptly and the OS later hands its pid to an unrelated process, both
+hooks keep declining to start a watcher until that process ends.
+
+**Three.** The daemon reaches herdr through `subprocess.run` with no
+timeout. A herdr that hangs instead of failing leaves the daemon alive,
+stuck in that call, still holding the pidfile — the five-consecutive-
+failures exit needs the call to *return* — so the hooks see a live pid and
+decline to start a replacement.
+
+When you suspect the daemon is dead, tell the cases apart before you touch
+anything: read the pid out of `HERDR_PLUGIN_STATE_DIR/daemon.pid` and run
+`ps -p <pid> -o command=` to see whether it is really `readpending.py
+daemon`.
+
+- **Case one, no pidfile.** Nothing to clean up. Press the toggle key, or
+  touch any agent, and a hook starts a fresh daemon.
+- **Case two, the pid belongs to something else.** Delete the pidfile, then
+  press the toggle key. Do **not** kill that pid — it is not the daemon.
+- **Case three, the pid really is a stuck `readpending.py daemon`.** Kill it
+  first, then delete the pidfile if it outlives the process, then press the
+  toggle key. Deleting the pidfile alone is wrong here: the stuck daemon is
+  still alive, may unblock later, and you'd end up with two watchers on one
+  queue.
+
+"Press the toggle key" buys the same thing in every case above: the toggle
+starts a watcher whenever it leaves anything pending, so it works on any
+agent, marked or not, and opening the read-pending list does the same.
+Neither starts anything on an empty queue — correctly, since there is
+nothing to watch.
+
+- **Case four, `overlay.open` reused.** A different pidfile, the same reuse
+  limit. `HERDR_PLUGIN_STATE_DIR/overlay.open` names the pid of the overlay
+  process; if the OS hands that pid to an unrelated process, the daemon
+  reads the overlay as still on screen and arms nothing, so no badge ever
+  clears. `STATE_DIR` survives a reboot and low pids get re-allocated almost
+  immediately after one, so a reboot is the likeliest way in. The tell is
+  marks that queue up and never clear, however often the reader leaves and
+  returns. Fix it the same shape as case two: read the pid out of
+  `HERDR_PLUGIN_STATE_DIR/overlay.open`, run `ps -p <pid> -o command=`, and
+  delete the file if it is not a `readpending.py ui`. The plugin never
+  cleans this up on its own — the reader only ever deletes a marker by
+  opening the overlay again, which overwrites it.
+
+One caveat no pidfile surgery fixes: the daemon writes badges through herdr
+while it holds the queue lock, so if a *badge* call is what hangs, the
+toggle key blocks too — killing the daemon is the only thing that frees it.
 
 ## Install
 
@@ -101,27 +175,35 @@ q / esc          close
 ```
 
 Re-polls every second while open, to keep the labels and statuses current.
-That is display only: auto-clear is the focus hook's job, whether the list is
+That is display only: auto-clear is the daemon's job, whether the list is
 open or not.
 
 ## How it works
 
 - Queue: `HERDR_PLUGIN_STATE_DIR/queue.json` (falls back to
-  `~/.local/state/herdr/readpending/`), an ordered list of pane ids mutated
-  under an `flock`.
+  `~/.local/state/herdr/readpending/`), a list of mark records —
+  `{"pane": "<pane id>", "armed": <bool>, "mark": <id>}` — mutated under an
+  `flock`. A queue of bare pane ids written by an older version of this
+  plugin still loads, as unarmed marks.
 - Badge: `herdr pane report-metadata <pane> --source rcosteira.readpending
   --token read=📖<n>`; cleared with `--clear-token read`. Position = 1-based
   index in the queue; every queue change renumbers all badges.
-- Auto-clear: herdr's `pane.focused` hook runs the `on-focus` subcommand, which
-  calls the shared remove path for the pane that gained focus.
-- Dead panes (closed) are pruned on the next toggle or list refresh.
+- Auto-clear: the poll daemon (`readpending.py daemon`) is the only code
+  that removes a pane from the queue automatically — besides arming and
+  clearing marks on focus, it drops a mark whose pane herdr has stopped
+  listing. Single instance via `HERDR_PLUGIN_STATE_DIR/daemon.pid`; it exits
+  after 3 empty polls or 5 consecutive herdr failures, and either manifest
+  hook restarts it.
 
 To change the badge glyph/format, edit `GLYPH` / `_set_badge` in
 `readpending.py`.
 
 ## Requirements
 
-- herdr ≥ 0.8.2 (for the `pane.focused` event hook that clears on focus)
+- herdr ≥ 0.8.2 — the version a manifest event hook was confirmed to load
+  on. Both `pane.focused` and `pane.agent_status_changed` stay in the
+  manifest, but only to wake the auto-clear daemon; see
+  [How auto-clear works](#how-auto-clear-works).
 - Python 3 (stdlib only; uses `curses` for the overlay)
 - macOS or Linux
 
