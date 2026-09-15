@@ -277,8 +277,11 @@ def _pid_alive(pid):
 
 
 def _read_pid():
+    # `with`, for the reason _overlay_open uses one: a bare open() leaves the
+    # descriptor to the refcounter, and this runs on every poll.
     try:
-        return int(open(PIDFILE).read().strip())
+        with open(PIDFILE) as f:
+            return int(f.read().strip())
     except (FileNotFoundError, ValueError, OSError):
         return None
 
