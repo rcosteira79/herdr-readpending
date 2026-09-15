@@ -9,6 +9,10 @@ a display token `read` = "<glyph><position>" set via `herdr pane
 report-metadata`; add `$read` to [ui.sidebar.agents] rows to see it. Position
 follows queue order.
 
+The overlay list holds a second state file, HERDR_PLUGIN_STATE_DIR/overlay.open,
+for as long as it is on screen. The overlay takes focus itself, so auto-clear
+arms no mark while that file exists.
+
 Auto-clear-on-focus is a herdr event hook. The manifest asks for
 `pane.focused`, and herdr runs `readpending.py on-focus` naming the pane that
 just gained focus. No daemon, no poll loop: the event *is* the transition the
@@ -43,6 +47,7 @@ STATE_DIR = os.environ.get("HERDR_PLUGIN_STATE_DIR") or os.path.expanduser(
 )
 QUEUE = os.path.join(STATE_DIR, "queue.json")
 LOCK = os.path.join(STATE_DIR, "queue.lock")
+OVERLAY_MARKER = os.path.join(STATE_DIR, "overlay.open")
 
 
 def herdr(*args):
@@ -224,6 +229,80 @@ def _remove(pane_id):
     return False
 
 
+# ---- auto-clear-on-focus (poll daemon) ------------------------------------
+
+def _overlay_open():
+    """Is the read-pending overlay on screen? The overlay takes focus while it
+    is, so herdr reports every agent unfocused and the daemon must not arm
+    through that — checking the queue would silently change it."""
+    return os.path.exists(OVERLAY_MARKER)
+
+
+def _set_overlay_marker():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(OVERLAY_MARKER, "w") as f:
+        f.write(str(os.getpid()))
+
+
+def _clear_overlay_marker():
+    try:
+        os.remove(OVERLAY_MARKER)
+    except OSError:
+        pass
+
+
+def _sample_focus(queue, agents):
+    """Pair each queued mark with what `herdr agent list` just said about its
+    pane: whether herdr still lists it, and whether it is focused. Taken OUTSIDE
+    the lock, so it can be stale by the time it lands."""
+    sample = {}
+    for entry in queue:
+        pane = _pane(entry)
+        info = agents.get(pane)
+        sample[pane] = (entry["mark"], info is not None, bool((info or {}).get("focused")))
+    return sample
+
+
+def _apply_focus_sample(sample):
+    """Locked: arm every sampled mark seen unfocused, drop every armed mark seen
+    focused, and drop every sampled mark whose pane herdr no longer lists. A
+    mark whose id moved since the sample is a different mark on the same pane,
+    so the sample says nothing about it and it is left alone.
+
+    Arming, and only arming, stops while the overlay is on screen: the overlay
+    holds focus itself, so every agent reads unfocused and arming through that
+    would clear the mark on whichever agent the reader goes back to. Clearing an
+    already-armed mark and dropping a closed pane still run."""
+    cleared = []
+    arming = not _overlay_open()  # read outside the lock: it is only a stat
+    with _Lock():
+        queue = _load()
+        kept = []
+        changed = False
+        for entry in queue:
+            seen = sample.get(_pane(entry))
+            if seen is None or seen[0] != entry["mark"]:
+                kept.append(entry)
+                continue
+            _, alive, focused = seen
+            if not alive:
+                changed = True  # the pane closed; there is no badge left to clear
+            elif not focused:
+                if arming and not entry["armed"]:
+                    entry["armed"] = True
+                    changed = True
+                kept.append(entry)
+            elif entry["armed"]:
+                _clear_badge(_pane(entry))
+                cleared.append(_pane(entry))
+                changed = True
+            else:
+                kept.append(entry)
+        if changed:
+            _save(_reindex(kept, prune=False))
+    return cleared
+
+
 # ---- auto-clear-on-focus (herdr event hook) -------------------------------
 
 def cmd_on_focus():
@@ -399,7 +478,14 @@ def cmd_ui():
                 herdr("agent", "focus", _pane(queue[sel]))  # the focus hook clears it
                 return  # close the overlay after jumping
 
-    curses.wrapper(run)
+    # The overlay takes focus, so the daemon arms nothing while this exists.
+    # It has to go on the way out of every exit, crash included: a marker left
+    # behind would switch arming off for the rest of the session.
+    _set_overlay_marker()
+    try:
+        curses.wrapper(run)
+    finally:
+        _clear_overlay_marker()
     return 0
 
 

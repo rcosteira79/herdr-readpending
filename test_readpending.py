@@ -5,6 +5,7 @@ Run with `python3 test_readpending.py`. Standard library only, same as the
 plugin. The state directory is a temporary one and the herdr CLI is replaced, so
 nothing here touches a real queue or a real pane.
 """
+import curses
 import io
 import json
 import os
@@ -213,6 +214,128 @@ check("the already-queued pane is gone, not duplicated",
 check("its badge was cleared",
       any(a[:2] == ("pane", "report-metadata") and "--clear-token" in a for a in CALLS),
       str(CALLS))
+
+print("\nthe daemon arms a mark before it clears it")
+sample = R._sample_focus([R._entry("w1:pA", 5), R._entry("w1:pB", 6)],
+                         {"w1:pA": {"focused": True}})
+check("the sample carries the mark, alive and focused as herdr just reported it",
+      sample.get("w1:pA") == (5, True, True), str(sample))
+check("a pane herdr no longer lists is sampled as gone",
+      sample.get("w1:pB") == (6, False, False), str(sample))
+
+R._clear_overlay_marker()
+R._save([R._entry("w1:pA", 5)])
+del CALLS[:]
+cleared = R._apply_focus_sample({"w1:pA": (5, True, False)})
+loaded = R._load()
+check("an unfocused mark clears nothing yet", cleared == [], str(cleared))
+check("it stays queued", panes(loaded) == ["w1:pA"], str(loaded))
+check("it is now armed", loaded and loaded[0]["armed"] is True, str(loaded))
+
+R._save([R._entry("w1:pA", 5, True), R._entry("w1:pB", 6)])
+del CALLS[:]
+cleared = R._apply_focus_sample({"w1:pA": (5, True, True), "w1:pB": (6, True, True)})
+loaded = R._load()
+check("an armed mark seen focused is reported cleared", cleared == ["w1:pA"], str(cleared))
+check("it is gone from the queue", panes(loaded) == ["w1:pB"], str(loaded))
+check("its badge was cleared",
+      any(a[:2] == ("pane", "report-metadata") and "--clear-token" in a for a in CALLS),
+      str(CALLS))
+badges = [a for a in CALLS if "--token" in a]
+check("the mark left behind is renumbered to 1",
+      len(badges) == 1 and any("=%s1" % R.GLYPH in part for part in badges[0]),
+      str(badges))
+
+R._save([R._entry("w1:pA", 5)])
+del CALLS[:]
+cleared = R._apply_focus_sample({"w1:pA": (5, True, True)})
+loaded = R._load()
+check("a focused mark that was never armed is not cleared", cleared == [], str(cleared))
+check("it stays queued and unarmed",
+      panes(loaded) == ["w1:pA"] and loaded[0]["armed"] is False, str(loaded))
+check("an unchanged queue writes no badge at all", CALLS == [], str(CALLS))
+
+R._save([R._entry("w1:pA", 9)])
+del CALLS[:]
+cleared = R._apply_focus_sample({"w1:pA": (5, True, False)})
+loaded = R._load()
+check("a sample older than the mark on that pane arms nothing",
+      panes(loaded) == ["w1:pA"] and loaded[0]["armed"] is False, str(loaded))
+check("and clears nothing", cleared == [] and CALLS == [], str(CALLS))
+
+R._save([R._entry("w1:pA", 5)])
+del CALLS[:]
+cleared = R._apply_focus_sample({})
+loaded = R._load()
+check("a mark missing from the sample is untouched",
+      panes(loaded) == ["w1:pA"] and loaded[0]["armed"] is False, str(loaded))
+check("and nothing is cleared for it", cleared == [] and CALLS == [], str(CALLS))
+
+R._save([R._entry("w1:pA", 5, True)])
+del CALLS[:]
+cleared = R._apply_focus_sample({"w1:pA": (5, False, False)})
+loaded = R._load()
+check("a mark whose pane herdr stopped listing is dropped",
+      panes(loaded) == [], str(loaded))
+check("no badge is cleared on a pane that is gone",
+      not any("--clear-token" in a for a in CALLS), str(CALLS))
+check("nothing is reported cleared for it", cleared == [], str(cleared))
+
+R._save([R._entry("w1:pA", 5)])
+R._set_overlay_marker()
+del CALLS[:]
+cleared = R._apply_focus_sample({"w1:pA": (5, True, False)})
+loaded = R._load()
+check("the overlay marker stops an unfocused mark being armed",
+      panes(loaded) == ["w1:pA"] and loaded[0]["armed"] is False, str(loaded))
+check("and writes no badge while the overlay is on screen",
+      cleared == [] and CALLS == [], str(CALLS))
+
+R._save([R._entry("w1:pA", 5, True)])
+cleared = R._apply_focus_sample({"w1:pA": (5, True, True)})
+check("an already-armed mark still clears while the overlay is on screen",
+      cleared == ["w1:pA"] and panes(R._load()) == [], str(cleared))
+
+R._save([R._entry("w1:pA", 5, True)])
+R._apply_focus_sample({"w1:pA": (5, False, False)})
+check("a closed pane is still dropped while the overlay is on screen",
+      panes(R._load()) == [], str(R._load()))
+
+R._clear_overlay_marker()
+R._save([R._entry("w1:pA", 5)])
+R._apply_focus_sample({"w1:pA": (5, True, False)})
+loaded = R._load()
+check("with the overlay gone the same sample arms the mark",
+      loaded and loaded[0]["armed"] is True, str(loaded))
+
+SEEN = []
+
+
+def fake_wrapper(fn):
+    """Stand in for curses.wrapper: record whether the marker is on disk while
+    the overlay is 'on screen', without touching a terminal."""
+    SEEN.append(os.path.exists(R.OVERLAY_MARKER))
+
+
+def angry_wrapper(fn):
+    raise RuntimeError("the overlay blew up")
+
+
+curses.wrapper = fake_wrapper
+R.cmd_ui()
+check("the overlay marker exists while the list is on screen", SEEN == [True], str(SEEN))
+check("the overlay marker is gone once the list exits",
+      not os.path.exists(R.OVERLAY_MARKER))
+
+curses.wrapper = angry_wrapper
+try:
+    R.cmd_ui()
+    raised = False
+except RuntimeError:
+    raised = True
+check("a crash in the overlay is not swallowed", raised)
+check("a crash in the overlay leaves no stale marker behind",
+      not os.path.exists(R.OVERLAY_MARKER))
 
 print("\nthe daemon is gone")
 check("no daemon subcommand", "daemon" not in R.DISPATCH, str(list(R.DISPATCH)))
