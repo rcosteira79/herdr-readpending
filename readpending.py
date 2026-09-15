@@ -234,6 +234,19 @@ def _cwd_tail(info):
     return os.path.basename(cwd.rstrip("/")) if cwd else ""
 
 
+def _visible(queue, agents):
+    """Queue entries whose pane herdr still knows about."""
+    return [e for e in queue if _pane(e) in agents]
+
+
+def _index_of(queue, pane_id):
+    """Where `pane_id` sits in `queue` right now, or None if it is gone."""
+    for i, entry in enumerate(queue):
+        if _pane(entry) == pane_id:
+            return i
+    return None
+
+
 def _move(queue, index, delta):
     j = index + delta
     if 0 <= j < len(queue):
@@ -255,7 +268,7 @@ def cmd_ui():
             raw = live_agents()
             agents = raw if raw is not None else {}
             # Don't prune the display when the server is briefly unreachable.
-            queue = _load() if raw is None else [p for p in _load() if p in agents]
+            queue = _load() if raw is None else _visible(_load(), agents)
             if sel >= len(queue):
                 sel = max(0, len(queue) - 1)
 
@@ -270,7 +283,8 @@ def cmd_ui():
                 if h > 3:
                     stdscr.addnstr(3, 0, "(nothing pending)", w - 1, curses.A_DIM)
             else:
-                for i, pane_id in enumerate(queue):
+                for i, entry in enumerate(queue):
+                    pane_id = _pane(entry)
                     row = i + 3
                     if row >= h:
                         break
@@ -300,24 +314,21 @@ def cmd_ui():
                 sel = min(len(queue) - 1, sel + 1)
             elif ch in (ord("k"), curses.KEY_UP):
                 sel = max(0, sel - 1)
-            elif ch in (ord("J"),):
+            elif ch in (ord("J"), ord("K")):
+                picked = _pane(queue[sel])
                 with _Lock():
                     q = _load()
-                    q = [p for p in q if p in agents]
-                    if sel < len(q):
-                        sel = _move(q, sel, +1)
+                    at = _index_of(q, picked)
+                    if at is not None:
+                        _move(q, at, +1 if ch == ord("J") else -1)
                         _save(_reindex(q, prune=False))
-            elif ch in (ord("K"),):
-                with _Lock():
-                    q = _load()
-                    q = [p for p in q if p in agents]
-                    if sel < len(q):
-                        sel = _move(q, sel, -1)
-                        _save(_reindex(q, prune=False))
+                seen = _index_of(_visible(q, agents), picked)
+                if seen is not None:
+                    sel = seen
             elif ch in (ord("x"),):
-                _remove(queue[sel])
+                _remove(_pane(queue[sel]))
             elif ch in (curses.KEY_ENTER, 10, 13):
-                herdr("agent", "focus", queue[sel])  # the focus hook clears it
+                herdr("agent", "focus", _pane(queue[sel]))  # the focus hook clears it
                 return  # close the overlay after jumping
 
     curses.wrapper(run)

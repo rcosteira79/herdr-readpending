@@ -112,6 +112,17 @@ check("remove of a queued pane returns True", R._remove("w1:pA") is True)
 check("the other pane remains", panes(R._load()) == ["w1:pB"], str(R._load()))
 check("remove of an absent pane returns False", R._remove("w1:pZ") is False)
 check("the queue is unchanged", panes(R._load()) == ["w1:pB"], str(R._load()))
+visible = R._visible([{"pane": "w1:pA"}, {"pane": "w1:pB"}], {"w1:pB": {}})
+check("_visible keeps only panes herdr still knows about",
+      panes(visible) == ["w1:pB"], str(visible))
+check("_index_of finds the pane's current slot",
+      R._index_of([{"pane": "w1:pA"}, {"pane": "w1:pB"}], "w1:pB") == 1)
+check("_index_of returns None when the pane is gone",
+      R._index_of([{"pane": "w1:pA"}], "w1:pZ") is None)
+q = [{"pane": "w1:pA"}, {"pane": "w1:pB"}]
+moved = R._move(q, 0, +1)
+check("_move returns the new index", moved == 1, str(moved))
+check("_move swaps the entries in place", panes(q) == ["w1:pB", "w1:pA"], str(q))
 
 print("\nthe daemon is gone")
 check("no daemon subcommand", "daemon" not in R.DISPATCH, str(list(R.DISPATCH)))
