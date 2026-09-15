@@ -33,6 +33,7 @@ Subcommands:
 import fcntl
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -262,6 +263,36 @@ PIDFILE = os.path.join(STATE_DIR, "daemon.pid")
 POLL_SECONDS = 1
 
 
+def _exit_on_signal(*signums):
+    """Make a fatal signal unwind instead of ending the process outright.
+
+    Python installs no handler for SIGTERM or SIGHUP, and the default
+    disposition terminates without unwinding, so no `finally` runs. Both
+    long-lived processes here clean up in a `finally`: the daemon removes its
+    pidfile, the overlay removes its marker. SIGTERM at shutdown is the ordinary
+    way both of them die, not an abrupt kill.
+
+    A pidfile left behind holds a pid the OS re-issues from a low water mark on
+    the next boot. If that pid is live, _ensure_daemon declines to spawn for
+    that process's whole lifetime and auto-clear is silently dead. A marker left
+    behind reads as closed as soon as its writer is gone, so the overlay's half
+    is the milder one — but it fails the same way if the pid is re-issued.
+
+    This changes nothing about the single-instance claim itself, which the
+    design settled: `os.kill(pid, 0)` still proves only that some process holds
+    that pid, and the README still gives the recovery for that case.
+
+    sys.exit raises SystemExit, so the existing cleanup runs unchanged."""
+    def _bail(signum, frame):
+        sys.exit(0)
+
+    for num in signums:
+        try:
+            signal.signal(num, _bail)
+        except (ValueError, OSError, AttributeError):
+            pass  # not the main thread, or this platform has no such signal
+
+
 def _pid_alive(pid):
     if not pid or pid < 0:  # a negative pid would probe a process GROUP
         return False
@@ -411,6 +442,10 @@ def _exit_if_idle():
 
 
 def cmd_daemon():
+    # Before the pidfile is written, so no window exists where the file is on
+    # disk and SIGTERM would still skip the finally that removes it.
+    _exit_on_signal(signal.SIGTERM, signal.SIGHUP)
+
     # Single instance: claim the pidfile, or bail if a live daemon owns it.
     with _Lock():
         existing = _read_pid()
@@ -544,6 +579,12 @@ def _reorder(queue, index, delta, agents):
 
 
 def cmd_ui():
+    # Signal handlers before the marker, for the reason cmd_daemon installs its
+    # own first: they touch no state and change no focus, so they cost the rule
+    # below nothing, and they close the window where the marker is on disk but
+    # SIGTERM would still skip the finally that removes it.
+    _exit_on_signal(signal.SIGTERM, signal.SIGHUP)
+
     # Claim the marker first, before this process does anything else. The
     # overlay pane already holds focus, so every agent reads unfocused from
     # the moment herdr spawns us — work done above this line is done with

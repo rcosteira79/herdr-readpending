@@ -10,6 +10,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import sys
 import tempfile
 
@@ -640,7 +641,69 @@ check("a live daemon already owns the pidfile, so a second one bails out",
 check("and the running daemon's pidfile is left alone", R._read_pid() == 1)
 os.remove(R.PIDFILE)
 
+
+print("\nboth long-lived processes survive SIGTERM long enough to clean up")
+# Python installs no SIGTERM handler, so the default disposition terminates the
+# process without unwinding and neither finally block runs. The daemon is
+# SIGTERMed at every shutdown, and the pidfile it leaves holds a pid the OS
+# re-issues from a low water mark on the next boot -- if that pid is live,
+# _ensure_daemon declines to spawn for its whole lifetime.
+#
+# These checks read the disposition that is in force inside each process rather
+# than signalling this one: an unhandled SIGTERM would kill the test runner
+# instead of failing a check.
+_seen = {}
+_real_live = R.live_agents
+
+
+def _peek_daemon():
+    _seen["daemon"] = signal.getsignal(signal.SIGTERM)
+    R._save([])  # empty the queue so the loop reaches its own exit
+    return {}
+
+
+_outer_term = signal.getsignal(signal.SIGTERM)
+_outer_hup = signal.getsignal(signal.SIGHUP)
+R._save([R._entry("w1:pA", 5)])
+R.live_agents = _peek_daemon
+with open(R.PIDFILE, "w") as f:
+    f.write(str(os.getpid()))
+check("the daemon loop still exits", R.cmd_daemon() == 0)
+R.live_agents = _real_live
+check("SIGTERM is handled inside the daemon loop, not left at its default",
+      _seen.get("daemon") not in (signal.SIG_DFL, None), repr(_seen.get("daemon")))
+_raised = None
+if callable(_seen.get("daemon")):
+    try:
+        _seen["daemon"](signal.SIGTERM, None)
+    except BaseException as _exc:
+        _raised = _exc
+check("and that handler raises SystemExit, so the finally block runs",
+      isinstance(_raised, SystemExit), repr(_raised))
+check("the daemon's pidfile is gone", not os.path.exists(R.PIDFILE))
+
 R.POLL_SECONDS = _real_poll
+
+
+def _peek_overlay(fn):
+    _seen["ui-term"] = signal.getsignal(signal.SIGTERM)
+    _seen["ui-hup"] = signal.getsignal(signal.SIGHUP)
+
+
+R._clear_overlay_marker()
+R._save([R._entry("w1:pA", 5)])
+curses.wrapper = _peek_overlay
+R.cmd_ui()
+curses.wrapper = real_wrapper
+check("SIGTERM is handled while the overlay is on screen",
+      _seen.get("ui-term") not in (signal.SIG_DFL, None), repr(_seen.get("ui-term")))
+check("so is SIGHUP, which is what closing the pane sends",
+      _seen.get("ui-hup") not in (signal.SIG_DFL, None), repr(_seen.get("ui-hup")))
+check("and the overlay marker is gone once it exits",
+      not os.path.exists(R.OVERLAY_MARKER))
+
+signal.signal(signal.SIGTERM, _outer_term)
+signal.signal(signal.SIGHUP, _outer_hup)
 R._save([])
 
 
