@@ -618,6 +618,32 @@ check("and it is gone once the overlay exits",
 curses.wrapper = real_wrapper
 
 
+print("\nboth overlay entry points start the daemon on their own terms")
+# cmd_ui starts it only on a non-empty queue; cmd_open_list starts it every
+# time. The difference is deliberate and the README describes it, but neither
+# side had a check: deleting cmd_ui's guard, or cmd_open_list's whole first
+# line, left the suite green.
+R._clear_overlay_marker()
+if os.path.exists(R.PIDFILE):
+    os.remove(R.PIDFILE)
+R._save([])
+del SPAWNS[:]
+curses.wrapper = fake_wrapper
+R.cmd_ui()
+check("an empty queue starts no daemon from the overlay", SPAWNS == [], str(SPAWNS))
+curses.wrapper = real_wrapper
+check("and the overlay still cleared its marker on the way out",
+      not os.path.exists(R.OVERLAY_MARKER))
+
+del SPAWNS[:]
+del CALLS[:]
+R._save([])
+check("cmd_open_list starts the daemon even with an empty queue",
+      R.cmd_open_list() == 0 and SPAWNS == [False], str(SPAWNS))
+check("and it asks herdr to open the list pane",
+      any(a[:3] == ("plugin", "pane", "open") for a in CALLS), str(CALLS))
+
+
 print("\na herdr binary that will not launch reads as unreachable")
 # subprocess.run raises FileNotFoundError when the binary is missing; check=False
 # only suppresses a non-zero exit. Unhandled, it escapes live_agents and kills
