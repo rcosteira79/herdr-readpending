@@ -40,9 +40,37 @@ class Done:
     stderr = ""
 
 
+# Which panes `herdr agent list` reports. None means the server is unreachable,
+# which is what every check saw before this existed: live_agents returned None,
+# so _reindex's prune branch never ran anywhere in the file and the checks that
+# depend on pruning passed because it was skipped.
+AGENTS = None
+
+
+def set_agents(*pane_ids):
+    global AGENTS
+    AGENTS = {p: {"pane_id": p, "name": p} for p in pane_ids}
+
+
+def no_agents():
+    """Back to an unreachable server."""
+    global AGENTS
+    AGENTS = None
+
+
 def fake_herdr(*args):
-    """Record herdr calls instead of making them."""
+    """Record herdr calls instead of making them.
+
+    `agent list` answers from AGENTS, in the wire shape live_agents parses, so
+    the prune branch is reachable from a check. Every other subcommand returns
+    the same empty success it always did."""
     CALLS.append(args)
+    if args[:2] == ("agent", "list") and AGENTS is not None:
+        class Listed:
+            returncode = 0
+            stdout = json.dumps({"result": {"agents": list(AGENTS.values())}})
+            stderr = ""
+        return Listed()
     return Done()
 
 
@@ -70,11 +98,14 @@ check("two badges rewritten", len(badges) == 2, str(badges))
 check("they read 1 and 2",
       all(any("=%s%d" % (R.GLYPH, n) in part for part in a) for n, a in enumerate(badges, 1)),
       str(badges))
+set_agents("w1:pA", "w1:pB")  # _remove prunes; say which panes herdr still lists
 R._save([{"pane": "w1:pA"}, {"pane": "w1:pB"}])
 check("remove of a queued pane returns True", R._remove("w1:pA") is True)
-check("the other pane remains", panes(R._load()) == ["w1:pB"], str(R._load()))
+check("the other pane remains, because herdr still lists it",
+      panes(R._load()) == ["w1:pB"], str(R._load()))
 check("remove of an absent pane returns False", R._remove("w1:pZ") is False)
 check("the queue is unchanged", panes(R._load()) == ["w1:pB"], str(R._load()))
+no_agents()
 visible = R._visible([{"pane": "w1:pA"}, {"pane": "w1:pB"}], {"w1:pB": {}})
 check("_visible keeps only panes herdr still knows about",
       panes(visible) == ["w1:pB"], str(visible))
@@ -499,6 +530,40 @@ os.environ["HERDR_PANE_ID"] = "w1:pA"
 R.cmd_toggle()
 check("emptying the queue starts nothing, there is nothing left to watch",
       SPAWNS == [], str(SPAWNS))
+
+print("\n_reindex's prune branch drops panes herdr no longer lists")
+# Open question 13: fake_herdr returned an empty stdout, so live_agents failed
+# its JSON parse and returned None for every check in this file. prune=True
+# therefore never pruned anywhere, and the slice 1 check named "the other pane
+# remains" passed because pruning was skipped rather than because the pane was
+# still listed.
+set_agents("w1:pA")
+R._save([R._entry("w1:pA", 1), R._entry("w1:pB", 2)])
+check("_reindex drops a queued pane herdr stopped listing",
+      panes(R._reindex(R._load(), prune=True)) == ["w1:pA"],
+      str(R._reindex(R._load(), prune=True)))
+check("prune=False keeps that same pane",
+      panes(R._reindex(R._load(), prune=False)) == ["w1:pA", "w1:pB"],
+      str(R._reindex(R._load(), prune=False)))
+
+no_agents()
+check("an unreachable server skips pruning, it does not empty the queue",
+      panes(R._reindex(R._load(), prune=True)) == ["w1:pA", "w1:pB"],
+      str(R._reindex(R._load(), prune=True)))
+
+set_agents("w1:pA")
+R._save([R._entry("w1:pA", 1), R._entry("w1:pB", 2)])
+check("_remove prunes as well as removes", R._remove("w1:pA") is True)
+check("so a pane herdr stopped listing goes with it",
+      panes(R._load()) == [], str(R._load()))
+
+set_agents("w1:pA", "w1:pB")
+R._save([R._entry("w1:pA", 1), R._entry("w1:pB", 2)])
+check("a pane herdr still lists survives the same removal",
+      R._remove("w1:pA") is True and panes(R._load()) == ["w1:pB"], str(R._load()))
+no_agents()
+R._save([])
+
 
 print("\nthe manifest wakes the daemon on both hooks")
 manifest = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
