@@ -28,6 +28,10 @@ def check(name, ok, detail=""):
         FAILED.append(name)
 
 
+def panes(q):
+    return [R._pane(e) for e in q]
+
+
 class Done:
     returncode = 0
     stdout = ""
@@ -93,6 +97,21 @@ os.environ["HERDR_PLUGIN_CONTEXT_JSON"] = json.dumps({"focused_pane_id": "w1:pA"
 R.cmd_on_focus()
 check("the pane named in the context is cleared", R._load() == [], str(R._load()))
 os.environ.pop("HERDR_PLUGIN_CONTEXT_JSON", None)
+
+print("\nthe queue is read through one accessor")
+R._save([{"pane": "w1:pA"}, {"pane": "w1:pB"}])
+del CALLS[:]
+R._reindex(R._load(), prune=False)
+badges = [a for a in CALLS if "--token" in a]
+check("two badges rewritten", len(badges) == 2, str(badges))
+check("they read 1 and 2",
+      all(any("=%s%d" % (R.GLYPH, n) in part for part in a) for n, a in enumerate(badges, 1)),
+      str(badges))
+R._save([{"pane": "w1:pA"}, {"pane": "w1:pB"}])
+check("remove of a queued pane returns True", R._remove("w1:pA") is True)
+check("the other pane remains", panes(R._load()) == ["w1:pB"], str(R._load()))
+check("remove of an absent pane returns False", R._remove("w1:pZ") is False)
+check("the queue is unchanged", panes(R._load()) == ["w1:pB"], str(R._load()))
 
 print("\nthe daemon is gone")
 check("no daemon subcommand", "daemon" not in R.DISPATCH, str(list(R.DISPATCH)))

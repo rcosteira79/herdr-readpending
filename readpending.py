@@ -65,6 +65,12 @@ def _save(queue):
     os.replace(tmp, QUEUE)
 
 
+def _pane(entry):
+    """The pane id of a queue entry. Entries are records; a bare string is the
+    pre-mark format an installed plugin still holds on disk."""
+    return entry.get("pane") if isinstance(entry, dict) else entry
+
+
 class _Lock:
     def __enter__(self):
         os.makedirs(STATE_DIR, exist_ok=True)
@@ -113,9 +119,9 @@ def _reindex(queue, prune=True):
     if prune:
         agents = live_agents()
         if agents is not None:  # skip pruning if the server is unreachable
-            queue = [p for p in queue if p in agents]
-    for i, pane_id in enumerate(queue, start=1):
-        _set_badge(pane_id, i)
+            queue = [e for e in queue if _pane(e) in agents]
+    for i, entry in enumerate(queue, start=1):
+        _set_badge(_pane(entry), i)
     return queue
 
 
@@ -166,10 +172,10 @@ def _remove(pane_id):
     """Locked: drop a pane from the queue, clear its badge, renumber."""
     with _Lock():
         queue = _load()
-        if pane_id in queue:
-            queue.remove(pane_id)
+        kept = [e for e in queue if _pane(e) != pane_id]
+        if len(kept) != len(queue):
             _clear_badge(pane_id)
-            _save(_reindex(queue))
+            _save(_reindex(kept))
             return True
     return False
 
