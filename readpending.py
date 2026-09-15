@@ -9,13 +9,18 @@ a display token `read` = "<glyph><position>" set via `herdr pane
 report-metadata`; add `$read` to [ui.sidebar.agents] rows to see it. Position
 follows queue order.
 
-Auto-clear-on-focus is a herdr event hook. The manifest asks for
-`pane.focused`, and herdr runs `readpending.py on-focus` naming the pane that
-just gained focus. No daemon, no poll loop: the event *is* the transition the
-old daemon spent a second at a time looking for.
+The overlay list holds a second state file, HERDR_PLUGIN_STATE_DIR/overlay.open,
+for as long as it is on screen. The overlay takes focus itself, so auto-clear
+arms no mark while that file exists. The file names the pid that wrote it, so a
+marker whose pid is gone reads as closed and arming goes on.
 
-Spell the event with dots. herdr's API schema lists the same kinds with
-underscores, and the manifest turns `pane_focused` down with "unknown event".
+herdr delivers no plugin event when focus moves between workspaces, so
+auto-clear-on-focus runs a companion poll daemon (readpending.py daemon)
+instead: it polls `herdr agent list` once a second, arms a mark once it sees
+that pane unfocused, and clears an armed mark the moment its pane gains focus.
+Marking the pane you are already looking at therefore clears nothing until you
+leave it and come back. See docs/adr/0001-poll-for-focus-not-events.md for why
+the event hook alone cannot carry this.
 
 The list pane is a summon-anywhere overlay for viewing and reordering. It does
 not own auto-clear.
@@ -24,11 +29,13 @@ Subcommands:
   toggle       add/remove the focused agent (action, `pane` context)
   open-list    open the overlay list pane (global action)
   ui           the interactive overlay list pane
-  on-focus     clear the pane that just gained focus (event hook)
+  ensure-daemon  make sure the auto-clear daemon is alive (event hook)
+  daemon       the auto-clear watcher (spawned, detached)
 """
 import fcntl
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -43,13 +50,31 @@ STATE_DIR = os.environ.get("HERDR_PLUGIN_STATE_DIR") or os.path.expanduser(
 )
 QUEUE = os.path.join(STATE_DIR, "queue.json")
 LOCK = os.path.join(STATE_DIR, "queue.lock")
+OVERLAY_MARKER = os.path.join(STATE_DIR, "overlay.open")
 
 
 def herdr(*args):
-    """Run the herdr CLI; return CompletedProcess (never raises on non-zero)."""
-    return subprocess.run(
-        [HERDR, *args], capture_output=True, text=True, check=False
-    )
+    """Run the herdr CLI; return CompletedProcess (never raises).
+
+    `check=False` only suppresses a non-zero exit. A binary that will not launch
+    at all — missing, replaced mid-update, a bad HERDR_BIN_PATH inherited by the
+    daemon — raises OSError, and unhandled that escapes live_agents and kills
+    the daemon on the poll that hits it, with stderr going to DEVNULL. Report it
+    as a failed call instead, so the five-consecutive-failures exit covers it.
+
+    Two things keep "never raises" true. `errors="replace"` stops a byte the
+    locale cannot decode from raising UnicodeDecodeError out of the decode
+    itself — agent names and cwd tails come back through `agent list`, and the
+    daemon inherits whatever locale the herdr session had. The handler catches
+    ValueError as well as OSError, because UnicodeDecodeError is a ValueError
+    and an OSError-only handler let it through."""
+    try:
+        return subprocess.run(
+            [HERDR, *args], capture_output=True, text=True,
+            errors="replace", check=False,
+        )
+    except (OSError, ValueError) as exc:
+        return subprocess.CompletedProcess([HERDR, *args], 127, "", str(exc))
 
 
 def _entry(pane, mark=0, armed=False):
@@ -117,15 +142,21 @@ class _Lock:
 def live_agents():
     """pane_id -> agent info dict, for panes that still exist.
     Returns None if the herdr CLI/server can't be reached (distinct from an
-    empty session), so callers don't mistake "server down" for "no agents"."""
+    empty session), so callers don't mistake "server down" for "no agents".
+
+    Building the map is inside the try, not after it: a response that parses
+    but carries the wrong type — `"agents": null`, a list of strings, a list
+    holding a null — raises from the comprehension, and an unhandled raise here
+    escapes the daemon's poll loop with stderr going to DEVNULL. A shape this
+    function cannot read is a herdr it cannot reach."""
     res = herdr("agent", "list")
     if res.returncode != 0:
         return None
     try:
         agents = json.loads(res.stdout)["result"]["agents"]
-    except (json.JSONDecodeError, KeyError, TypeError):
+        return {a["pane_id"]: a for a in agents if a.get("pane_id")}
+    except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
         return None
-    return {a["pane_id"]: a for a in agents if a.get("pane_id")}
 
 
 def _set_badge(pane_id, position):
@@ -207,7 +238,11 @@ def cmd_toggle():
             queue = kept
         else:
             queue.append(_entry(target, _next_mark(queue)))
-        _save(_reindex(queue, agents=agents))
+        queue = _reindex(queue, agents=agents)
+        _save(queue)
+        pending = bool(queue)
+    if pending:
+        _ensure_daemon()
     return 0
 
 
@@ -224,30 +259,252 @@ def _remove(pane_id):
     return False
 
 
-# ---- auto-clear-on-focus (herdr event hook) -------------------------------
+# ---- auto-clear-on-focus (poll daemon) ------------------------------------
 
-def cmd_on_focus():
-    """Clear the pane that just gained focus. Run by herdr on `pane.focused`.
+PIDFILE = os.path.join(STATE_DIR, "daemon.pid")
+POLL_SECONDS = 1
 
-    herdr names the pane *gaining* focus, in HERDR_PANE_ID and in the context
-    blob's focused_pane_id. Verified on herdr 0.8.2: focusing a new pane fires
-    once for it, and closing that pane fires again for the pane that gets focus
-    back. So the pane id in hand is the one the reader is now looking at.
 
-    Marking the pane you are already on does not clear it: no focus change
-    happened, so no event fires. Leaving and coming back clears it.
+def _exit_on_signal(*signums):
+    """Make a fatal signal unwind instead of ending the process outright.
 
-    A missed event costs a badge that lingers, and the next focus of that pane
-    clears it. That is why this needs no safety poll.
-    """
-    target = _resolve_target()
-    if not target:
-        return 0
-    _remove(target)
+    Python installs no handler for SIGTERM or SIGHUP, and the default
+    disposition terminates without unwinding, so no `finally` runs. Both
+    long-lived processes here clean up in a `finally`: the daemon removes its
+    pidfile, the overlay removes its marker. SIGTERM at shutdown is the ordinary
+    way both of them die, not an abrupt kill.
+
+    A pidfile left behind holds a pid the OS re-issues from a low water mark on
+    the next boot. If that pid is live, _ensure_daemon declines to spawn for
+    that process's whole lifetime and auto-clear is silently dead. A marker left
+    behind reads as closed as soon as its writer is gone, so the overlay's half
+    is the milder one — but it fails the same way if the pid is re-issued.
+
+    This changes nothing about the single-instance claim itself, which the
+    design settled: `os.kill(pid, 0)` still proves only that some process holds
+    that pid, and the README still gives the recovery for that case.
+
+    sys.exit raises SystemExit, so the existing cleanup runs unchanged."""
+    def _bail(signum, frame):
+        sys.exit(0)
+
+    for num in signums:
+        try:
+            signal.signal(num, _bail)
+        except (ValueError, OSError, AttributeError):
+            pass  # not the main thread, or this platform has no such signal
+
+
+def _pid_alive(pid):
+    if not pid or pid < 0:  # a negative pid would probe a process GROUP
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OverflowError:
+        return False  # too large for a pid; no process could hold it
+    except PermissionError:
+        return True  # exists but not ours
+    return True
+
+
+def _read_pid():
+    # `with`, for the reason _overlay_open uses one: a bare open() leaves the
+    # descriptor to the refcounter, and this runs on every poll.
+    try:
+        with open(PIDFILE) as f:
+            return int(f.read().strip())
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+
+
+def _overlay_open():
+    """Is the read-pending overlay on screen? The marker names the pid that
+    wrote it, because a `finally` does not run on SIGKILL: a marker whose writer
+    is gone reads as closed. This only reads. A stale marker is left where it
+    is — deleting it here would race a fresh overlay writing a live one, and it
+    decides nothing, because a dead pid reads closed every time."""
+    try:
+        with open(OVERLAY_MARKER) as f:
+            pid = int(f.read().strip())
+    except (FileNotFoundError, ValueError, OSError):
+        pid = None
+    return _pid_alive(pid)
+
+
+def _set_overlay_marker():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = OVERLAY_MARKER + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(str(os.getpid()))
+    os.replace(tmp, OVERLAY_MARKER)
+
+
+def _clear_overlay_marker():
+    try:
+        os.remove(OVERLAY_MARKER)
+    except OSError:
+        pass
+
+
+def _sample_focus(queue, agents):
+    """Pair each queued mark with what `herdr agent list` just said about its
+    pane: whether herdr still lists it, and whether it is focused. Taken OUTSIDE
+    the lock, so it can be stale by the time it lands."""
+    sample = {}
+    for entry in queue:
+        pane = _pane(entry)
+        info = agents.get(pane)
+        sample[pane] = (entry["mark"], info is not None, bool((info or {}).get("focused")))
+    return sample
+
+
+def _apply_focus_sample(sample, arming):
+    """Locked: arm every sampled mark seen unfocused, drop every armed mark seen
+    focused, and drop every sampled mark whose pane herdr no longer lists. A
+    mark whose id moved since the sample is a different mark on the same pane,
+    so the sample says nothing about it and it is left alone.
+
+    Arming, and only arming, stops while the overlay is on screen: the overlay
+    holds focus itself, so every agent reads unfocused and arming through that
+    would clear the mark on whichever agent the reader goes back to. Clearing an
+    already-armed mark and dropping a closed pane still run.
+
+    `arming` is the caller's marker read, which it takes BEFORE it samples, so
+    an overlay that closes mid-sample cannot arm a sample the overlay produced.
+    The read below catches the opposite case, an overlay that opened after the
+    caller read. Neither read closes the race: an overlay that opens and closes
+    between the two is still missed. They only narrow each window to the time
+    between the reads."""
+    cleared = []
+    with _Lock():
+        arming = arming and not _overlay_open()  # also caught an overlay that opened mid-sample
+        queue = _load()
+        kept = []
+        changed = False
+        for entry in queue:
+            seen = sample.get(_pane(entry))
+            if seen is None or seen[0] != entry["mark"]:
+                kept.append(entry)
+                continue
+            _, alive, focused = seen
+            if not alive:
+                changed = True  # the pane closed; there is no badge left to clear
+            elif not focused:
+                if arming and not entry["armed"]:
+                    entry["armed"] = True
+                    changed = True
+                kept.append(entry)
+            elif entry["armed"]:
+                _clear_badge(_pane(entry))
+                cleared.append(_pane(entry))
+                changed = True
+            else:
+                kept.append(entry)
+        if changed:
+            _save(_reindex(kept, prune=False))
+    return cleared
+
+
+def _spawn_daemon():
+    script = os.path.abspath(__file__)
+    subprocess.Popen(
+        [sys.executable, script, "daemon"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        cwd=os.path.dirname(script),
+        env=os.environ.copy(),
+    )
+
+
+def _ensure_daemon():
+    """Start the auto-clear daemon if one isn't already running."""
+    with _Lock():
+        if _pid_alive(_read_pid()):
+            return
+    _spawn_daemon()
+
+
+def _exit_if_idle():
+    """Locked: is the queue still empty? Then stop watching and give up the
+    pidfile inside the same lock the toggle takes, so a mark landing now waits
+    for this lock, finds no pid, and starts a fresh daemon."""
+    with _Lock():
+        if _load():
+            return False
+        if _read_pid() == os.getpid():
+            try:
+                os.remove(PIDFILE)
+            except OSError:
+                pass
+        return True
+
+
+def cmd_daemon():
+    # Before the pidfile is written, so no window exists where the file is on
+    # disk and SIGTERM would still skip the finally that removes it.
+    _exit_on_signal(signal.SIGTERM, signal.SIGHUP)
+
+    # Single instance: claim the pidfile, or bail if a live daemon owns it.
+    with _Lock():
+        existing = _read_pid()
+        if _pid_alive(existing) and existing != os.getpid():
+            return 0
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(PIDFILE, "w") as f:
+            f.write(str(os.getpid()))
+
+    empty_polls = 0
+    server_fails = 0
+    try:
+        while True:
+            queue = _load()
+            if not queue:
+                empty_polls += 1
+                if empty_polls >= 3:
+                    if _exit_if_idle():
+                        break
+                    empty_polls = 0
+                time.sleep(POLL_SECONDS)
+                continue
+            empty_polls = 0
+
+            arming = not _overlay_open()  # before the sample, never after it
+            agents = live_agents()
+            if agents is None:
+                server_fails += 1
+                if server_fails >= 5:  # herdr gone -> exit
+                    break
+                time.sleep(POLL_SECONDS)
+                continue
+            server_fails = 0
+
+            _apply_focus_sample(_sample_focus(queue, agents), arming)
+            time.sleep(POLL_SECONDS)
+    finally:
+        with _Lock():
+            if _read_pid() == os.getpid():
+                try:
+                    os.remove(PIDFILE)
+                except OSError:
+                    pass
+    return 0
+
+
+# ---- the event-hook entrypoint --------------------------------------------
+
+def cmd_ensure_daemon():
+    """Both manifest hooks run this. It removes nothing: it only restarts a dead
+    daemon. See docs/adr/0001-poll-for-focus-not-events.md."""
+    _ensure_daemon()
     return 0
 
 
 def cmd_open_list():
+    _ensure_daemon()
     res = herdr(
         "plugin", "pane", "open",
         "--plugin", PLUGIN_ID,
@@ -324,82 +581,106 @@ def _reorder(queue, index, delta, agents):
 
 
 def cmd_ui():
-    import curses
+    # Signal handlers before the marker, for the reason cmd_daemon installs its
+    # own first: they touch no state and change no focus, so they cost the rule
+    # below nothing, and they close the window where the marker is on disk but
+    # SIGTERM would still skip the finally that removes it.
+    _exit_on_signal(signal.SIGTERM, signal.SIGHUP)
 
-    def run(stdscr):
-        curses.curs_set(0)
-        # Refresh cadence (ms) for the display only. Auto-clear is the
-        # `pane.focused` hook's job, whether this pane is open or not.
-        stdscr.timeout(1000)
-        sel = 0
-        while True:
-            raw = live_agents()
-            agents = raw if raw is not None else {}
-            # Don't prune the display when the server is briefly unreachable.
-            queue = _load() if raw is None else _visible(_load(), agents)
-            if sel >= len(queue):
-                sel = max(0, len(queue) - 1)
+    # Claim the marker first, before this process does anything else. The
+    # overlay pane already holds focus, so every agent reads unfocused from
+    # the moment herdr spawns us — work done above this line is done with
+    # arming still on, and _ensure_daemon below can start the very daemon
+    # that would then arm the whole queue off the overlay's own focus.
+    # It has to go on the way out of every exit, crash included: a marker
+    # left behind would switch arming off for the rest of the session.
+    _set_overlay_marker()
+    try:
+        import curses
 
-            stdscr.erase()
-            h, w = stdscr.getmaxyx()
-            header = "READ PENDING"
-            hint = "j/k select · J/K reorder · enter jump · x remove · q quit"
-            stdscr.addnstr(0, 0, header, w - 1, curses.A_BOLD)
-            if h > 1:
-                stdscr.addnstr(1, 0, hint, w - 1, curses.A_DIM)
-            if not queue:
-                if h > 3:
-                    stdscr.addnstr(3, 0, "(nothing pending)", w - 1, curses.A_DIM)
-            else:
-                for i, entry in enumerate(queue):
-                    pane_id = _pane(entry)
-                    row = i + 3
-                    if row >= h:
-                        break
-                    info = agents.get(pane_id, {"pane_id": pane_id})
-                    tail = _cwd_tail(info)
-                    status = info.get("agent_status", "")
-                    line = f"{i + 1:>2}. {_label(info)}"
-                    if status:
-                        line += f"  [{status}]"
-                    if tail:
-                        line += f"  ({tail})"
-                    attr = curses.A_REVERSE if i == sel else curses.A_NORMAL
-                    stdscr.addnstr(row, 0, line.ljust(w - 1), w - 1, attr)
-            stdscr.refresh()
+        if _load():
+            _ensure_daemon()
 
-            try:
-                ch = stdscr.getch()
-            except KeyboardInterrupt:
-                return
-            if ch == -1:
-                continue  # timeout -> refresh
-            if ch in (ord("q"), 27):
-                return
-            if not queue:
-                continue
-            if ch in (ord("j"), curses.KEY_DOWN):
-                sel = min(len(queue) - 1, sel + 1)
-            elif ch in (ord("k"), curses.KEY_UP):
-                sel = max(0, sel - 1)
-            elif ch in (ord("J"), ord("K")):
-                picked = _pane(queue[sel])
-                with _Lock():
-                    q = _load()
-                    at = _index_of(q, picked)
-                    delta = +1 if ch == ord("J") else -1
-                    if at is not None and _reorder(q, at, delta, agents):
-                        _save(_reindex(q, prune=False))
-                seen = _index_of(_visible(q, agents), picked)
-                if seen is not None:
-                    sel = seen
-            elif ch in (ord("x"),):
-                _remove(_pane(queue[sel]))
-            elif ch in (curses.KEY_ENTER, 10, 13):
-                herdr("agent", "focus", _pane(queue[sel]))  # the focus hook clears it
-                return  # close the overlay after jumping
+        def run(stdscr):
+            curses.curs_set(0)
+            # Refresh cadence (ms) for the display only. Auto-clear is the
+            # poll daemon's job, whether this pane is open or not.
+            stdscr.timeout(1000)
+            sel = 0
+            while True:
+                raw = live_agents()
+                agents = raw if raw is not None else {}
+                # Don't prune the display when the server is briefly unreachable.
+                queue = _load() if raw is None else _visible(_load(), agents)
+                if sel >= len(queue):
+                    sel = max(0, len(queue) - 1)
 
-    curses.wrapper(run)
+                stdscr.erase()
+                h, w = stdscr.getmaxyx()
+                header = "READ PENDING"
+                hint = "j/k select · J/K reorder · enter jump · x remove · q quit"
+                stdscr.addnstr(0, 0, header, w - 1, curses.A_BOLD)
+                if h > 1:
+                    stdscr.addnstr(1, 0, hint, w - 1, curses.A_DIM)
+                if not queue:
+                    if h > 3:
+                        stdscr.addnstr(3, 0, "(nothing pending)", w - 1, curses.A_DIM)
+                else:
+                    for i, entry in enumerate(queue):
+                        pane_id = _pane(entry)
+                        row = i + 3
+                        if row >= h:
+                            break
+                        info = agents.get(pane_id, {"pane_id": pane_id})
+                        tail = _cwd_tail(info)
+                        status = info.get("agent_status", "")
+                        line = f"{i + 1:>2}. {_label(info)}"
+                        if status:
+                            line += f"  [{status}]"
+                        if tail:
+                            line += f"  ({tail})"
+                        attr = curses.A_REVERSE if i == sel else curses.A_NORMAL
+                        stdscr.addnstr(row, 0, line.ljust(w - 1), w - 1, attr)
+                stdscr.refresh()
+
+                try:
+                    ch = stdscr.getch()
+                except KeyboardInterrupt:
+                    return
+                if ch == -1:
+                    continue  # timeout -> refresh
+                if ch in (ord("q"), 27):
+                    return
+                if not queue:
+                    continue
+                if ch in (ord("j"), curses.KEY_DOWN):
+                    sel = min(len(queue) - 1, sel + 1)
+                elif ch in (ord("k"), curses.KEY_UP):
+                    sel = max(0, sel - 1)
+                elif ch in (ord("J"), ord("K")):
+                    picked = _pane(queue[sel])
+                    with _Lock():
+                        q = _load()
+                        at = _index_of(q, picked)
+                        delta = +1 if ch == ord("J") else -1
+                        if at is not None and _reorder(q, at, delta, agents):
+                            _save(_reindex(q, prune=False))
+                    seen = _index_of(_visible(q, agents), picked)
+                    if seen is not None:
+                        sel = seen
+                elif ch in (ord("x"),):
+                    _remove(_pane(queue[sel]))
+                elif ch in (curses.KEY_ENTER, 10, 13):
+                    # Jumping here does not clear the mark by itself: an unarmed
+                    # mark (one made on the agent the reader was already on)
+                    # only clears once the daemon has seen this pane unfocused
+                    # and then focused again, i.e. on the next leave-and-return.
+                    herdr("agent", "focus", _pane(queue[sel]))
+                    return  # close the overlay after jumping
+
+        curses.wrapper(run)
+    finally:
+        _clear_overlay_marker()
     return 0
 
 
@@ -407,7 +688,8 @@ DISPATCH = {
     "toggle": cmd_toggle,
     "open-list": cmd_open_list,
     "ui": cmd_ui,
-    "on-focus": cmd_on_focus,
+    "ensure-daemon": cmd_ensure_daemon,
+    "daemon": cmd_daemon,
 }
 
 

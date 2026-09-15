@@ -5,10 +5,12 @@ Run with `python3 test_readpending.py`. Standard library only, same as the
 plugin. The state directory is a temporary one and the herdr CLI is replaced, so
 nothing here touches a real queue or a real pane.
 """
+import curses
 import io
 import json
 import os
 import shutil
+import signal
 import sys
 import tempfile
 
@@ -32,71 +34,82 @@ def panes(q):
     return [R._pane(e) for e in q]
 
 
+def bounded(fn, seconds=5):
+    """Run fn under an alarm and return what it returned, or the TimeoutError.
+
+    cmd_daemon runs below with POLL_SECONDS = 0, so a regression in an exit
+    condition is a busy loop rather than a slow one. Unbounded, check() never
+    runs: there is no FAIL line and no exit code, only a hung run at 100% CPU.
+    Returning the error instead of raising it lets the caller's check report a
+    failure the ordinary way."""
+    def _expired(signum, frame):
+        raise TimeoutError("did not return within %ds" % seconds)
+
+    previous = signal.signal(signal.SIGALRM, _expired)
+    signal.alarm(seconds)
+    try:
+        return fn()
+    except TimeoutError as exc:
+        return exc
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+
 class Done:
     returncode = 0
     stdout = ""
     stderr = ""
 
 
+# Which panes `herdr agent list` reports. None means the server is unreachable,
+# which is what every check saw before this existed: live_agents returned None,
+# so _reindex's prune branch never ran anywhere in the file and the checks that
+# depend on pruning passed because it was skipped.
+AGENTS = None
+
+
+def set_agents(*pane_ids):
+    global AGENTS
+    AGENTS = {p: {"pane_id": p, "name": p} for p in pane_ids}
+
+
+def no_agents():
+    """Back to an unreachable server."""
+    global AGENTS
+    AGENTS = None
+
+
 def fake_herdr(*args):
-    """Record herdr calls instead of making them."""
+    """Record herdr calls instead of making them.
+
+    `agent list` answers from AGENTS, in the wire shape live_agents parses, so
+    the prune branch is reachable from a check. Every other subcommand returns
+    the same empty success it always did."""
     CALLS.append(args)
+    if args[:2] == ("agent", "list") and AGENTS is not None:
+        class Listed:
+            returncode = 0
+            stdout = json.dumps({"result": {"agents": list(AGENTS.values())}})
+            stderr = ""
+        return Listed()
     return Done()
 
 
+REAL_HERDR = R.herdr  # the real subprocess wrapper, for the missing-binary check
 R.herdr = fake_herdr
 
-
-def focus_event(pane_id, queue):
-    """One `pane.focused` hook run, shaped the way herdr shapes it."""
-    del CALLS[:]
-    R._save(queue)
-    for key in ("HERDR_ACTIVE_PANE_ID", "HERDR_PANE_ID", "HERDR_PLUGIN_CONTEXT_JSON"):
-        os.environ.pop(key, None)
-    if pane_id is not None:
-        os.environ["HERDR_PANE_ID"] = pane_id
-    R.cmd_on_focus()
-    return R._load()
+SPAWNS = []
 
 
-print("\nfocusing a pending pane clears it")
-left = focus_event("w1:pA", ["w1:pA", "w1:pB"])
-check("the focused pane is gone", "w1:pA" not in panes(left), str(left))
-check("the other pane stays", panes(left) == ["w1:pB"], str(left))
-check("its badge was cleared",
-      any(a[:2] == ("pane", "report-metadata") and "--clear-token" in a for a in CALLS),
-      str(CALLS))
+def fake_spawn():
+    # Record whether the overlay marker was already on disk at the spawn,
+    # so the order cmd_ui does its work in is asserted, not assumed.
+    SPAWNS.append(os.path.exists(R.OVERLAY_MARKER))
 
-print("\nthe rest of the queue is renumbered")
-R._save(["w1:pA", "w1:pB", "w1:pC"])
-os.environ["HERDR_PANE_ID"] = "w1:pA"
-del CALLS[:]
-R.cmd_on_focus()
-badges = [a for a in CALLS if "--token" in a]
-check("two badges rewritten", len(badges) == 2, str(badges))
-check("they read 1 and 2",
-      all(any("=%s%d" % (R.GLYPH, n) in part for part in a) for n, a in enumerate(badges, 1)),
-      str(badges))
 
-print("\nfocusing a pane that is not pending changes nothing")
-left = focus_event("w1:pZ", ["w1:pA"])
-check("the queue is untouched", panes(left) == ["w1:pA"], str(left))
-check("no badge was cleared",
-      not any("--clear-token" in a for a in CALLS), str(CALLS))
+R._spawn_daemon = fake_spawn
 
-print("\nan event naming no pane is ignored")
-left = focus_event(None, ["w1:pA"])
-check("the queue is untouched", panes(left) == ["w1:pA"], str(left))
-check("it exits cleanly", True)
-
-print("\nthe context blob is used when HERDR_PANE_ID is absent")
-del CALLS[:]
-R._save(["w1:pA"])
-os.environ.pop("HERDR_PANE_ID", None)
-os.environ["HERDR_PLUGIN_CONTEXT_JSON"] = json.dumps({"focused_pane_id": "w1:pA"})
-R.cmd_on_focus()
-check("the pane named in the context is cleared", panes(R._load()) == [], str(R._load()))
-os.environ.pop("HERDR_PLUGIN_CONTEXT_JSON", None)
 
 print("\nthe queue is read through one accessor")
 R._save([{"pane": "w1:pA"}, {"pane": "w1:pB"}])
@@ -107,11 +120,14 @@ check("two badges rewritten", len(badges) == 2, str(badges))
 check("they read 1 and 2",
       all(any("=%s%d" % (R.GLYPH, n) in part for part in a) for n, a in enumerate(badges, 1)),
       str(badges))
+set_agents("w1:pA", "w1:pB")  # _remove prunes; say which panes herdr still lists
 R._save([{"pane": "w1:pA"}, {"pane": "w1:pB"}])
 check("remove of a queued pane returns True", R._remove("w1:pA") is True)
-check("the other pane remains", panes(R._load()) == ["w1:pB"], str(R._load()))
+check("the other pane remains, because herdr still lists it",
+      panes(R._load()) == ["w1:pB"], str(R._load()))
 check("remove of an absent pane returns False", R._remove("w1:pZ") is False)
 check("the queue is unchanged", panes(R._load()) == ["w1:pB"], str(R._load()))
+no_agents()
 visible = R._visible([{"pane": "w1:pA"}, {"pane": "w1:pB"}], {"w1:pB": {}})
 check("_visible keeps only panes herdr still knows about",
       panes(visible) == ["w1:pB"], str(visible))
@@ -214,13 +230,614 @@ check("its badge was cleared",
       any(a[:2] == ("pane", "report-metadata") and "--clear-token" in a for a in CALLS),
       str(CALLS))
 
-print("\nthe daemon is gone")
-check("no daemon subcommand", "daemon" not in R.DISPATCH, str(list(R.DISPATCH)))
-check("on-focus is dispatchable", "on-focus" in R.DISPATCH, str(list(R.DISPATCH)))
+print("\nthe daemon arms a mark before it clears it")
+sample = R._sample_focus([R._entry("w1:pA", 5), R._entry("w1:pB", 6)],
+                         {"w1:pA": {"focused": True}})
+check("the sample carries the mark, alive and focused as herdr just reported it",
+      sample.get("w1:pA") == (5, True, True), str(sample))
+check("a pane herdr no longer lists is sampled as gone",
+      sample.get("w1:pB") == (6, False, False), str(sample))
+
+R._clear_overlay_marker()
+R._save([R._entry("w1:pA", 5)])
+del CALLS[:]
+cleared = R._apply_focus_sample({"w1:pA": (5, True, False)}, True)
+loaded = R._load()
+check("an unfocused mark clears nothing yet", cleared == [], str(cleared))
+check("it stays queued", panes(loaded) == ["w1:pA"], str(loaded))
+check("it is now armed", loaded and loaded[0]["armed"] is True, str(loaded))
+
+R._save([R._entry("w1:pA", 5, True), R._entry("w1:pB", 6)])
+del CALLS[:]
+cleared = R._apply_focus_sample({"w1:pA": (5, True, True), "w1:pB": (6, True, True)}, True)
+loaded = R._load()
+check("an armed mark seen focused is reported cleared", cleared == ["w1:pA"], str(cleared))
+check("it is gone from the queue", panes(loaded) == ["w1:pB"], str(loaded))
+check("its badge was cleared",
+      any(a[:2] == ("pane", "report-metadata") and "--clear-token" in a for a in CALLS),
+      str(CALLS))
+badges = [a for a in CALLS if "--token" in a]
+check("the mark left behind is renumbered to 1",
+      len(badges) == 1 and any("=%s1" % R.GLYPH in part for part in badges[0]),
+      str(badges))
+
+R._save([R._entry("w1:pA", 5)])
+del CALLS[:]
+cleared = R._apply_focus_sample({"w1:pA": (5, True, True)}, True)
+loaded = R._load()
+check("a focused mark that was never armed is not cleared", cleared == [], str(cleared))
+check("it stays queued and unarmed",
+      panes(loaded) == ["w1:pA"] and loaded[0]["armed"] is False, str(loaded))
+check("an unchanged queue writes no badge at all", CALLS == [], str(CALLS))
+
+R._save([R._entry("w1:pA", 9)])
+del CALLS[:]
+cleared = R._apply_focus_sample({"w1:pA": (5, True, False)}, True)
+loaded = R._load()
+check("a sample older than the mark on that pane arms nothing",
+      panes(loaded) == ["w1:pA"] and loaded[0]["armed"] is False, str(loaded))
+check("and clears nothing", cleared == [] and CALLS == [], str(CALLS))
+
+R._save([R._entry("w1:pA", 5)])
+del CALLS[:]
+cleared = R._apply_focus_sample({}, True)
+loaded = R._load()
+check("a mark missing from the sample is untouched",
+      panes(loaded) == ["w1:pA"] and loaded[0]["armed"] is False, str(loaded))
+check("and nothing is cleared for it", cleared == [] and CALLS == [], str(CALLS))
+
+R._save([R._entry("w1:pA", 5, True)])
+del CALLS[:]
+cleared = R._apply_focus_sample({"w1:pA": (5, False, False)}, True)
+loaded = R._load()
+check("a mark whose pane herdr stopped listing is dropped",
+      panes(loaded) == [], str(loaded))
+check("no badge is cleared on a pane that is gone",
+      not any("--clear-token" in a for a in CALLS), str(CALLS))
+check("nothing is reported cleared for it", cleared == [], str(cleared))
+
+# These four pass arming=False, and _apply_focus_sample computes
+# `arming and not _overlay_open()`, so a marker on disk cannot change any of
+# their outcomes: the flag has already decided. They used to set the marker and
+# name it in their titles, which read as claims the marker was doing the work.
+# The marker's own effect is checked below, where arming=True is passed with a
+# marker on disk and the mark still does not arm.
+R._save([R._entry("w1:pA", 5)])
+del CALLS[:]
+cleared = R._apply_focus_sample({"w1:pA": (5, True, False)}, False)
+loaded = R._load()
+check("arming off stops an unfocused mark being armed",
+      panes(loaded) == ["w1:pA"] and loaded[0]["armed"] is False, str(loaded))
+check("and nothing changed, so no badge is written",
+      cleared == [] and CALLS == [], str(CALLS))
+
+R._save([R._entry("w1:pA", 5, True)])
+cleared = R._apply_focus_sample({"w1:pA": (5, True, True)}, False)
+check("an already-armed mark still clears with arming off",
+      cleared == ["w1:pA"] and panes(R._load()) == [], str(cleared))
+
+R._save([R._entry("w1:pA", 5, True)])
+R._apply_focus_sample({"w1:pA": (5, False, False)}, False)
+check("a closed pane is still dropped with arming off",
+      panes(R._load()) == [], str(R._load()))
+
+R._save([R._entry("w1:pA", 5)])
+R._apply_focus_sample({"w1:pA": (5, True, False)}, True)
+loaded = R._load()
+check("with arming on the same sample arms the mark",
+      loaded and loaded[0]["armed"] is True, str(loaded))
+
+
+def dead_pid():
+    """A pid that has certainly stopped: fork a child, reap it, hand back its id."""
+    pid = os.fork()
+    if pid == 0:
+        os._exit(0)
+    os.waitpid(pid, 0)
+    return pid
+
+
+R._set_overlay_marker()
+check("a marker holding a live pid reads as an open overlay",
+      R._overlay_open() is True)
+check("and a live marker is left on disk", os.path.exists(R.OVERLAY_MARKER))
+
+gone = dead_pid()
+with open(R.OVERLAY_MARKER, "w") as f:
+    f.write(str(gone))
+check("a marker holding a pid that is not running reads as closed",
+      R._overlay_open() is False, str(gone))
+check("and the reader leaves that stale marker where it is",
+      os.path.exists(R.OVERLAY_MARKER))
+
+with open(R.OVERLAY_MARKER, "w") as f:
+    f.write("not-a-pid")
+check("a marker holding junk reads as closed", R._overlay_open() is False)
+check("and the reader leaves that junk marker where it is",
+      os.path.exists(R.OVERLAY_MARKER))
+
+R._set_overlay_marker()
+check("writing a live marker over a stale one is what clears it",
+      R._overlay_open() is True)
+
+check("a pid that is not ours still reads as alive", R._pid_alive(1) is True)
+check("a negative pid reads as dead, never as a process group",
+      R._pid_alive(-1) is False)
+check("a pid too large for the OS to have issued reads as dead",
+      R._pid_alive(2 ** 64) is False)
+
+R._clear_overlay_marker()
+check("no marker at all reads as closed", R._overlay_open() is False)
+
+print("\nthe overlay marker is written in one step")
+with open(R.OVERLAY_MARKER, "w") as f:
+    f.write(str(gone))
+R._set_overlay_marker()
+with open(R.OVERLAY_MARKER) as f:
+    held = f.read().strip()
+check("a stale marker is replaced by one holding this process's pid",
+      held == str(os.getpid()), held)
+check("and no half-written marker is left beside it",
+      not os.path.exists(R.OVERLAY_MARKER + ".tmp"), str(os.listdir(STATE)))
+
+R._set_overlay_marker()
+with open(R.OVERLAY_MARKER) as f:
+    held = f.read().strip()
+check("writing it twice leaves one marker, still holding this pid",
+      held == str(os.getpid()), held)
+check("and still no temporary file beside that one either",
+      not os.path.exists(R.OVERLAY_MARKER + ".tmp"), str(os.listdir(STATE)))
+
+print("\nthe daemon decides to arm before it samples")
+R._clear_overlay_marker()
+R._save([R._entry("w1:pA", 5)])
+del CALLS[:]
+cleared = R._apply_focus_sample({"w1:pA": (5, True, False)}, False)
+loaded = R._load()
+check("a sample taken while the overlay was open arms nothing once it closes",
+      panes(loaded) == ["w1:pA"] and loaded[0]["armed"] is False, str(loaded))
+check("and no badge is written for it", cleared == [] and CALLS == [], str(CALLS))
+
+R._save([R._entry("w1:pA", 5)])
+del CALLS[:]
+R._apply_focus_sample({"w1:pA": (5, True, False)}, True)
+loaded = R._load()
+check("the same queue and sample arm when the caller read no overlay",
+      loaded and loaded[0]["armed"] is True, str(loaded))
+
+R._save([R._entry("w1:pA", 5)])
+R._set_overlay_marker()
+del CALLS[:]
+R._apply_focus_sample({"w1:pA": (5, True, False)}, True)
+loaded = R._load()
+check("an overlay that opened between the sample and the apply arms nothing",
+      loaded and loaded[0]["armed"] is False, str(loaded))
+R._clear_overlay_marker()
+
+R._save([R._entry("w1:pA", 5, True)])
+del CALLS[:]
+cleared = R._apply_focus_sample({"w1:pA": (5, True, True)}, False)
+check("suppression is arming-only: an armed mark seen focused still clears",
+      cleared == ["w1:pA"] and panes(R._load()) == [], str(cleared))
+check("and its badge was cleared",
+      any(a[:2] == ("pane", "report-metadata") and "--clear-token" in a for a in CALLS),
+      str(CALLS))
+
+R._save([R._entry("w1:pA", 5, True)])
+del CALLS[:]
+R._apply_focus_sample({"w1:pA": (5, False, False)}, False)
+check("suppression does not hold a closed pane in the queue",
+      panes(R._load()) == [], str(R._load()))
+
+SEEN = []
+
+
+def fake_wrapper(fn):
+    """Stand in for curses.wrapper: record whether the marker is on disk while
+    the overlay is 'on screen', without touching a terminal."""
+    SEEN.append(os.path.exists(R.OVERLAY_MARKER))
+
+
+def angry_wrapper(fn):
+    raise RuntimeError("the overlay blew up")
+
+
+real_wrapper = curses.wrapper
+curses.wrapper = fake_wrapper
+R.cmd_ui()
+check("the overlay marker exists while the list is on screen", SEEN == [True], str(SEEN))
+check("the overlay marker is gone once the list exits",
+      not os.path.exists(R.OVERLAY_MARKER))
+
+curses.wrapper = angry_wrapper
+try:
+    R.cmd_ui()
+    raised = False
+except RuntimeError:
+    raised = True
+check("a crash in the overlay is not swallowed", raised)
+check("a crash in the overlay leaves no stale marker behind",
+      not os.path.exists(R.OVERLAY_MARKER))
+
+curses.wrapper = real_wrapper
+check("the real curses.wrapper is back for every check below",
+      curses.wrapper.__module__ == "curses", str(curses.wrapper))
+
+print("\nthe daemon is back")
+check("the daemon subcommand exists", "daemon" in R.DISPATCH, str(list(R.DISPATCH)))
+check("ensure-daemon is dispatchable", "ensure-daemon" in R.DISPATCH, str(list(R.DISPATCH)))
+check("on-focus is gone", "on-focus" not in R.DISPATCH, str(list(R.DISPATCH)))
 src = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "readpending.py"), encoding="utf-8").read()
-check("nothing spawns a background process", "Popen" not in src)
-check("no poll interval is left behind", "POLL_SECONDS" not in src)
+check("the daemon spawns a background process", "Popen" in src)
+check("a poll interval is defined", "POLL_SECONDS" in src)
+body = src[src.index("def cmd_daemon"):]
+check("the daemon reads the overlay marker before it samples focus",
+      body.index("arming = not _overlay_open()") < body.index("agents = live_agents()"))
+
+print("\nonly one daemon claims the pidfile")
+if os.path.exists(R.PIDFILE):
+    os.remove(R.PIDFILE)
+del SPAWNS[:]
+R._ensure_daemon()
+check("no pidfile -> the daemon is spawned", len(SPAWNS) == 1, str(SPAWNS))
+
+open(R.PIDFILE, "w").write(str(os.getpid()))
+del SPAWNS[:]
+R._ensure_daemon()
+check("a live pid in the pidfile -> the daemon is not spawned",
+      SPAWNS == [], str(SPAWNS))
+
+open(R.PIDFILE, "w").write("not-a-pid")
+del SPAWNS[:]
+R._ensure_daemon()
+check("a garbage pidfile -> the daemon is spawned", len(SPAWNS) == 1, str(SPAWNS))
+
+print("\nthe daemon gives up the pidfile under the lock")
+R._save([])
+open(R.PIDFILE, "w").write(str(os.getpid()))
+check("an idle queue exits", R._exit_if_idle() is True)
+check("its pidfile is gone", os.path.exists(R.PIDFILE) is False)
+
+R._save([R._entry("w1:pA", 5)])
+open(R.PIDFILE, "w").write(str(os.getpid()))
+check("a mark landed while deciding -> the daemon does not exit",
+      R._exit_if_idle() is False)
+check("its pidfile is still there", os.path.exists(R.PIDFILE) is True)
+
+R._save([])
+open(R.PIDFILE, "w").write("1")
+check("a pidfile that is not ours -> the daemon still exits",
+      R._exit_if_idle() is True)
+check("but it is not ours to remove, so it is still there",
+      os.path.exists(R.PIDFILE) is True)
+
+if os.path.exists(R.PIDFILE):
+    os.remove(R.PIDFILE)
+
+print("\nthe hooks only wake the daemon")
+R._save([R._entry("w1:pA", 5)])
+if os.path.exists(R.PIDFILE):
+    os.remove(R.PIDFILE)
+del SPAWNS[:]
+R.cmd_ensure_daemon()
+loaded = R._load()
+check("the hook wakes the daemon", len(SPAWNS) == 1, str(SPAWNS))
+check("the hook removes nothing", panes(loaded) == ["w1:pA"], str(loaded))
+check("the mark it left behind is unarmed",
+      loaded and loaded[0]["armed"] is False, str(loaded))
+
+R._save([])
+if os.path.exists(R.PIDFILE):
+    os.remove(R.PIDFILE)
+del SPAWNS[:]
+for key in ("HERDR_ACTIVE_PANE_ID", "HERDR_PLUGIN_CONTEXT_JSON"):
+    os.environ.pop(key, None)
+os.environ["HERDR_PANE_ID"] = "w1:pA"
+R.cmd_toggle()
+check("marking an agent starts the watcher", len(SPAWNS) == 1, str(SPAWNS))
+
+R._save([R._entry("w1:pA", 5), R._entry("w1:pB", 6)])
+if os.path.exists(R.PIDFILE):
+    os.remove(R.PIDFILE)
+del SPAWNS[:]
+os.environ["HERDR_PANE_ID"] = "w1:pA"
+R.cmd_toggle()
+loaded = R._load()
+check("unmarking one of two pending agents still starts the watcher",
+      len(SPAWNS) == 1, str(SPAWNS))
+check("the one left pending is still queued", panes(loaded) == ["w1:pB"], str(loaded))
+
+R._save([R._entry("w1:pA", 5)])
+if os.path.exists(R.PIDFILE):
+    os.remove(R.PIDFILE)
+del SPAWNS[:]
+os.environ["HERDR_PANE_ID"] = "w1:pA"
+R.cmd_toggle()
+check("emptying the queue starts nothing, there is nothing left to watch",
+      SPAWNS == [], str(SPAWNS))
+
+print("\n_reindex's prune branch drops panes herdr no longer lists")
+# Open question 13: fake_herdr returned an empty stdout, so live_agents failed
+# its JSON parse and returned None for every check in this file. prune=True
+# therefore never pruned anywhere, and the slice 1 check named "the other pane
+# remains" passed because pruning was skipped rather than because the pane was
+# still listed.
+set_agents("w1:pA")
+R._save([R._entry("w1:pA", 1), R._entry("w1:pB", 2)])
+check("_reindex drops a queued pane herdr stopped listing",
+      panes(R._reindex(R._load(), prune=True)) == ["w1:pA"],
+      str(R._reindex(R._load(), prune=True)))
+check("prune=False keeps that same pane",
+      panes(R._reindex(R._load(), prune=False)) == ["w1:pA", "w1:pB"],
+      str(R._reindex(R._load(), prune=False)))
+
+no_agents()
+check("an unreachable server skips pruning, it does not empty the queue",
+      panes(R._reindex(R._load(), prune=True)) == ["w1:pA", "w1:pB"],
+      str(R._reindex(R._load(), prune=True)))
+
+set_agents("w1:pA")
+R._save([R._entry("w1:pA", 1), R._entry("w1:pB", 2)])
+check("_remove prunes as well as removes", R._remove("w1:pA") is True)
+check("so a pane herdr stopped listing goes with it",
+      panes(R._load()) == [], str(R._load()))
+
+set_agents("w1:pA", "w1:pB")
+R._save([R._entry("w1:pA", 1), R._entry("w1:pB", 2)])
+check("a pane herdr still lists survives the same removal",
+      R._remove("w1:pA") is True and panes(R._load()) == ["w1:pB"], str(R._load()))
+no_agents()
+R._save([])
+
+
+print("\nthe manifest wakes the daemon on both hooks")
+manifest = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "herdr-plugin.toml"), encoding="utf-8").read()
+check('on = "pane.focused" in manifest', 'on = "pane.focused"' in manifest)
+check('on = "pane.agent_status_changed" in manifest',
+      'on = "pane.agent_status_changed"' in manifest)
+check('"ensure-daemon" in manifest', "ensure-daemon" in manifest)
+check('"on-focus" not in manifest', "on-focus" not in manifest)
+check('min_herdr_version = "0.9.0" in manifest',
+      'min_herdr_version = "0.9.0"' in manifest)
+
+
+print("\nthe overlay claims the marker before it does anything else")
+# The overlay pane already holds focus when herdr spawns this process, so every
+# agent reads unfocused from the moment it starts. Anything cmd_ui does before
+# it writes the marker is done with arming still switched on — and one of those
+# things starts the daemon.
+R._clear_overlay_marker()
+if os.path.exists(R.PIDFILE):
+    os.remove(R.PIDFILE)
+R._save([R._entry("w1:pA", 5)])
+del SPAWNS[:]
+curses.wrapper = fake_wrapper
+R.cmd_ui()
+check("the marker was already written when cmd_ui started the daemon",
+      SPAWNS == [True], str(SPAWNS))
+check("and it is gone once the overlay exits",
+      not os.path.exists(R.OVERLAY_MARKER))
+curses.wrapper = real_wrapper
+
+
+print("\nboth overlay entry points start the daemon on their own terms")
+# cmd_ui starts it only on a non-empty queue; cmd_open_list starts it every
+# time. The difference is deliberate and the README describes it, but neither
+# side had a check: deleting cmd_ui's guard, or cmd_open_list's whole first
+# line, left the suite green.
+R._clear_overlay_marker()
+if os.path.exists(R.PIDFILE):
+    os.remove(R.PIDFILE)
+R._save([])
+del SPAWNS[:]
+curses.wrapper = fake_wrapper
+R.cmd_ui()
+check("an empty queue starts no daemon from the overlay", SPAWNS == [], str(SPAWNS))
+curses.wrapper = real_wrapper
+check("and the overlay still cleared its marker on the way out",
+      not os.path.exists(R.OVERLAY_MARKER))
+
+del SPAWNS[:]
+del CALLS[:]
+R._save([])
+check("cmd_open_list starts the daemon even with an empty queue",
+      R.cmd_open_list() == 0 and SPAWNS == [False], str(SPAWNS))
+check("and it asks herdr to open the list pane",
+      any(a[:3] == ("plugin", "pane", "open") for a in CALLS), str(CALLS))
+
+
+print("\na herdr binary that will not launch reads as unreachable")
+# subprocess.run raises FileNotFoundError when the binary is missing; check=False
+# only suppresses a non-zero exit. Unhandled, it escapes live_agents and kills
+# the daemon on the poll that hits it.
+R.herdr = REAL_HERDR
+_real_bin = R.HERDR
+R.HERDR = os.path.join(STATE, "no-such-herdr-binary")
+_raised = False
+try:
+    _res = R.herdr("agent", "list")
+except OSError:
+    _raised = True
+    _res = None
+check("calling a missing herdr binary does not raise", not _raised)
+check("it reports a non-zero return code", _res is not None and _res.returncode != 0,
+      str(_res))
+check("and live_agents reads that as unreachable, not as an empty session",
+      R.live_agents() is None)
+R.HERDR = _real_bin
+R.herdr = fake_herdr
+
+
+print("\nherdr output that will not decode reads as a failed call")
+# subprocess.run(text=True) decodes with the locale encoding and errors='strict'.
+# A byte the locale cannot decode raised UnicodeDecodeError, which is a
+# ValueError -- so the OSError handler missed it and the daemon died on the poll
+# that hit it. Agent names and cwd tails come back through `agent list`.
+R.herdr = REAL_HERDR
+_real_bin = R.HERDR
+R.HERDR = "/bin/sh"
+_raised = None
+try:
+    _res = R.herdr("-c", r"printf '\377\376'")
+except Exception as _exc:
+    _raised = _exc
+    _res = None
+check("undecodable output does not raise out of herdr", _raised is None, repr(_raised))
+check("it reports a return code instead", _res is not None and _res.returncode is not None,
+      str(_res))
+R.HERDR = _real_bin
+R.herdr = fake_herdr
+
+
+print("\nlive_agents survives every shape a herdr response can take")
+# The pane map was built outside the try, so a well-formed response carrying the
+# wrong type raised out of live_agents -- and out of the poll loop body, which
+# kills the daemon with stderr going to DEVNULL.
+_saved_fake = R.herdr
+
+
+def _responder(text):
+    class _Res:
+        returncode = 0
+        stdout = text
+        stderr = ""
+    return lambda *a: _Res()
+
+
+for _shape, _body in [
+    ("a null agent list", '{"result": {"agents": null}}'),
+    ("a list of strings", '{"result": {"agents": ["w1:pA"]}}'),
+    ("a mapping where a list belongs", '{"result": {"agents": {"w1:pA": {}}}}'),
+    ("a number where a list belongs", '{"result": {"agents": 3}}'),
+    ("a list holding a null", '{"result": {"agents": [null]}}'),
+]:
+    R.herdr = _responder(_body)
+    _raised = None
+    try:
+        _got = R.live_agents()
+    except Exception as _exc:
+        _raised = _exc
+        _got = None
+    check("%s does not raise out of live_agents" % _shape,
+          _raised is None, repr(_raised))
+    check("and %s reads as unreachable" % _shape, _got is None, str(_got))
+
+R.herdr = _responder('{"result": {"agents": [{"pane_id": "w1:pA", "name": "a"}]}}')
+_parsed = R.live_agents()
+check("a well-formed response still parses into a pane map",
+      _parsed is not None and list(_parsed) == ["w1:pA"], str(_parsed))
+R.herdr = _saved_fake
+
+
+print("\nthe daemon loop exits on both of its conditions")
+# Safe to run cmd_daemon here: with no poll interval every branch returns in
+# milliseconds. Without this the whole loop was covered by substring searches.
+# Each call goes through bounded(), so a regression in an exit condition fails a
+# check instead of hanging the run at 100% CPU with no output.
+def _never_returns():
+    while True:
+        pass
+
+
+_stuck = bounded(_never_returns, seconds=1)
+check("the alarm guard turns a loop that never returns into a failure",
+      isinstance(_stuck, TimeoutError), repr(_stuck))
+
+_real_poll = R.POLL_SECONDS
+R.POLL_SECONDS = 0
+
+R._save([])
+with open(R.PIDFILE, "w") as f:
+    f.write(str(os.getpid()))
+_got = bounded(R.cmd_daemon)
+check("an empty queue exits the loop", _got == 0, str(_got))
+check("and the daemon gave up its pidfile", not os.path.exists(R.PIDFILE))
+
+R._save([R._entry("w1:pA", 5)])
+_real_live = R.live_agents
+R.live_agents = lambda: None
+_got = bounded(R.cmd_daemon)
+check("five consecutive herdr failures exit the loop", _got == 0, str(_got))
+check("and that pidfile is gone too", not os.path.exists(R.PIDFILE))
+R.live_agents = _real_live
+
+with open(R.PIDFILE, "w") as f:
+    f.write("1")  # pid 1 is init: alive, and not us
+R._save([R._entry("w1:pA", 5)])
+_got = bounded(R.cmd_daemon)
+check("a live daemon already owns the pidfile, so a second one bails out",
+      _got == 0, str(_got))
+check("and the running daemon's pidfile is left alone", R._read_pid() == 1)
+os.remove(R.PIDFILE)
+
+
+print("\nboth long-lived processes survive SIGTERM long enough to clean up")
+# Python installs no SIGTERM handler, so the default disposition terminates the
+# process without unwinding and neither finally block runs. The daemon is
+# SIGTERMed at every shutdown, and the pidfile it leaves holds a pid the OS
+# re-issues from a low water mark on the next boot -- if that pid is live,
+# _ensure_daemon declines to spawn for its whole lifetime.
+#
+# These checks read the disposition that is in force inside each process rather
+# than signalling this one: an unhandled SIGTERM would kill the test runner
+# instead of failing a check.
+_seen = {}
+_real_live = R.live_agents
+
+
+def _peek_daemon():
+    _seen["daemon"] = signal.getsignal(signal.SIGTERM)
+    R._save([])  # empty the queue so the loop reaches its own exit
+    return {}
+
+
+_outer_term = signal.getsignal(signal.SIGTERM)
+_outer_hup = signal.getsignal(signal.SIGHUP)
+R._save([R._entry("w1:pA", 5)])
+R.live_agents = _peek_daemon
+with open(R.PIDFILE, "w") as f:
+    f.write(str(os.getpid()))
+_got = bounded(R.cmd_daemon)
+check("the daemon loop still exits", _got == 0, str(_got))
+R.live_agents = _real_live
+check("SIGTERM is handled inside the daemon loop, not left at its default",
+      _seen.get("daemon") not in (signal.SIG_DFL, None), repr(_seen.get("daemon")))
+_raised = None
+if callable(_seen.get("daemon")):
+    try:
+        _seen["daemon"](signal.SIGTERM, None)
+    except BaseException as _exc:
+        _raised = _exc
+check("and that handler raises SystemExit, so the finally block runs",
+      isinstance(_raised, SystemExit), repr(_raised))
+check("the daemon's pidfile is gone", not os.path.exists(R.PIDFILE))
+
+R.POLL_SECONDS = _real_poll
+
+
+def _peek_overlay(fn):
+    _seen["ui-term"] = signal.getsignal(signal.SIGTERM)
+    _seen["ui-hup"] = signal.getsignal(signal.SIGHUP)
+
+
+R._clear_overlay_marker()
+R._save([R._entry("w1:pA", 5)])
+curses.wrapper = _peek_overlay
+R.cmd_ui()
+curses.wrapper = real_wrapper
+check("SIGTERM is handled while the overlay is on screen",
+      _seen.get("ui-term") not in (signal.SIG_DFL, None), repr(_seen.get("ui-term")))
+check("so is SIGHUP, which is what closing the pane sends",
+      _seen.get("ui-hup") not in (signal.SIG_DFL, None), repr(_seen.get("ui-hup")))
+check("and the overlay marker is gone once it exits",
+      not os.path.exists(R.OVERLAY_MARKER))
+
+signal.signal(signal.SIGTERM, _outer_term)
+signal.signal(signal.SIGHUP, _outer_hup)
+R._save([])
+
 
 shutil.rmtree(STATE, ignore_errors=True)
 print("\n%s — %d of the checks failed"

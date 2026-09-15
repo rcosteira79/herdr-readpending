@@ -1,7 +1,7 @@
 id = "rcosteira.readpending"
 name = "Read Pending"
 version = "0.1.0"
-min_herdr_version = "0.8.2"
+min_herdr_version = "0.9.0"
 description = "Mark agents you haven't finished reading. Numbered badge ($read) + a reorderable list pane. Auto-clears when you focus the agent."
 platforms = ["macos", "linux"]
 
@@ -27,13 +27,26 @@ title = "Read Pending"
 command = ["python3", "readpending.py", "ui"]
 placement = "overlay"
 
-# Auto-clear-on-focus. herdr runs this on every focus change, naming the pane
-# that gained focus; the command drops that pane from the queue if it is in it.
+# Daemon wake-up hooks. Neither clears anything — the poll daemon does that.
+# Both hooks have one job: ensure the daemon stays alive. pane.focused restarts
+# a dead daemon at the moment the reader opens an agent inside a workspace.
+# pane.agent_status_changed is the most frequent trigger herdr publishes
+# reliably, because herdr publishes no startup or lifecycle event a manifest
+# can hook. See docs/adr/0001-poll-for-focus-not-events.md.
 #
 # Spell the event with dots. herdr's API schema lists the same kinds with
-# underscores, and the manifest turns `pane_focused` down with "unknown event".
-# That spelling is why an earlier note here said no pane event was accepted.
-# Verified on herdr 0.8.2, which is why min_herdr_version says 0.8.2.
+# underscores, and the manifest turns `pane_focused` down with "unknown event"
+# — and it turns down the manifest, not just the one hook.
+#
+# That rejection is why min_herdr_version says 0.9.0 rather than 0.8.2. A
+# manifest event hook was confirmed to load on 0.8.2, but that was one hook:
+# pane.focused. pane.agent_status_changed is only evidenced on 0.9.0, and an
+# unknown event name there would cost a 0.8.2 user the whole plugin, not one
+# degraded hook. The floor tracks the weaker-evidenced event, deliberately.
 [[events]]
 on = "pane.focused"
-command = ["python3", "readpending.py", "on-focus"]
+command = ["python3", "readpending.py", "ensure-daemon"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["python3", "readpending.py", "ensure-daemon"]
