@@ -552,6 +552,46 @@ R.HERDR = _real_bin
 R.herdr = fake_herdr
 
 
+print("\nlive_agents survives every shape a herdr response can take")
+# The pane map was built outside the try, so a well-formed response carrying the
+# wrong type raised out of live_agents -- and out of the poll loop body, which
+# kills the daemon with stderr going to DEVNULL.
+_saved_fake = R.herdr
+
+
+def _responder(text):
+    class _Res:
+        returncode = 0
+        stdout = text
+        stderr = ""
+    return lambda *a: _Res()
+
+
+for _shape, _body in [
+    ("a null agent list", '{"result": {"agents": null}}'),
+    ("a list of strings", '{"result": {"agents": ["w1:pA"]}}'),
+    ("a mapping where a list belongs", '{"result": {"agents": {"w1:pA": {}}}}'),
+    ("a number where a list belongs", '{"result": {"agents": 3}}'),
+    ("a list holding a null", '{"result": {"agents": [null]}}'),
+]:
+    R.herdr = _responder(_body)
+    _raised = None
+    try:
+        _got = R.live_agents()
+    except Exception as _exc:
+        _raised = _exc
+        _got = None
+    check("%s does not raise out of live_agents" % _shape,
+          _raised is None, repr(_raised))
+    check("and %s reads as unreachable" % _shape, _got is None, str(_got))
+
+R.herdr = _responder('{"result": {"agents": [{"pane_id": "w1:pA", "name": "a"}]}}')
+_parsed = R.live_agents()
+check("a well-formed response still parses into a pane map",
+      _parsed is not None and list(_parsed) == ["w1:pA"], str(_parsed))
+R.herdr = _saved_fake
+
+
 print("\nthe daemon loop exits on both of its conditions")
 # Safe to run cmd_daemon here: with no poll interval every branch returns in
 # milliseconds. Without this the whole loop was covered by substring searches.

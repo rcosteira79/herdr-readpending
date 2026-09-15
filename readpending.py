@@ -131,15 +131,21 @@ class _Lock:
 def live_agents():
     """pane_id -> agent info dict, for panes that still exist.
     Returns None if the herdr CLI/server can't be reached (distinct from an
-    empty session), so callers don't mistake "server down" for "no agents"."""
+    empty session), so callers don't mistake "server down" for "no agents".
+
+    Building the map is inside the try, not after it: a response that parses
+    but carries the wrong type — `"agents": null`, a list of strings, a list
+    holding a null — raises from the comprehension, and an unhandled raise here
+    escapes the daemon's poll loop with stderr going to DEVNULL. A shape this
+    function cannot read is a herdr it cannot reach."""
     res = herdr("agent", "list")
     if res.returncode != 0:
         return None
     try:
         agents = json.loads(res.stdout)["result"]["agents"]
-    except (json.JSONDecodeError, KeyError, TypeError):
+        return {a["pane_id"]: a for a in agents if a.get("pane_id")}
+    except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
         return None
-    return {a["pane_id"]: a for a in agents if a.get("pane_id")}
 
 
 def _set_badge(pane_id, position):
